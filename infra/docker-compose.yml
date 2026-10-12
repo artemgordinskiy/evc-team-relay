@@ -113,6 +113,10 @@ services:
   # is sound.
   control-plane-migrate-dry-run:
     image: infra-control-plane:candidate
+    # Opt-in only: :candidate is built locally by deploy.sh and never published, so a
+    # plain `docker compose up -d` must not try to pull it (GH #262). `compose run`
+    # on an explicitly named profiled service still works without --profile.
+    profiles: ["dry-run"]
     env_file:
       - ./.env
     environment:

@@ -86,7 +86,8 @@ RELAY_DIR=/opt/relay DRY_RUN=true bash -s -- control-plane < scripts/deploy.sh
 ```
 
 The check runs through `docker compose run --rm -T control-plane-migrate-dry-run`
-(`infra/docker-compose.yml`), not `docker run --env-file` — the latter cannot parse a multi-line
+(`infra/docker-compose.yml`; the service sits in the opt-in `dry-run` profile, so a plain
+`docker compose up -d` skips it, while naming it explicitly in `run` needs no `--profile`), not `docker run --env-file` — the latter cannot parse a multi-line
 value (`/opt/relay/.env` carries an ED25519 PEM key) and used to fail with `variable
 '-----END PRIVATE KEY-----"' contains whitespaces` before alembic ever ran, which read as a
 broken migration graph rather than what it actually was. Compose's own `env_file` parser handles
