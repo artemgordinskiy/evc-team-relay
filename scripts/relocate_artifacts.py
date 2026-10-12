@@ -20,7 +20,7 @@ import shlex
 import subprocess
 import tarfile
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
@@ -387,7 +387,7 @@ def finish(
     if maps(load_doc(relay.snapshot())) != plan["after_maps"]:
         raise Refused("CRDT verification failed; preserve journal and use --resume")
     if row.web_folder_items != plan["after_index"]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         connection.execute(
             shares.update()
             .where(shares.c.id == key)
