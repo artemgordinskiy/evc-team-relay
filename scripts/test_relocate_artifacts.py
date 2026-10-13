@@ -97,6 +97,82 @@ def test_relay_uses_registered_http_routes(scheme):
     print(f"GREEN: {scheme} snapshot and update use exact registered HTTP routes")
 
 
+def _operator_client(*, is_admin, role, owner_flag=False):
+    import httpx
+
+    share_id = "test-share"
+
+    def request(req):
+        if req.url.path == "/v1/auth/me":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "owner" if owner_flag else "operator",
+                    "is_admin": is_admin,
+                },
+            )
+        if req.url.path == f"/v1/shares/{share_id}":
+            return httpx.Response(
+                200, json={"owner_user_id": "owner", "kind": "folder"}
+            )
+        if req.url.path == f"/v1/shares/{share_id}/members":
+            members = (
+                []
+                if role is None
+                else [
+                    {"user_id": "operator", "role": role},
+                    {"user_id": "someone", "role": "editor"},
+                ]
+            )
+            return httpx.Response(200, json=members)
+        if req.url.path == "/v1/tokens/relay":
+            return httpx.Response(
+                200,
+                json={"relay_url": f"ws://relay.test/d/{share_id}/ws", "token": "t"},
+            )
+        return httpx.Response(404)
+
+    return httpx.Client(transport=httpx.MockTransport(request)), share_id
+
+
+def test_non_owner_refused_without_operator_flag():
+    client, share_id = _operator_client(is_admin=True, role="editor")
+    with client, pytest.raises(relocate.Refused):
+        relocate.Relay(client, "http://cp.test", "t", share_id)
+    print("RED CONTROL: non-owner admin editor refused without --operator-admin")
+
+
+def test_operator_admin_accepts_admin_editor_and_records_actor():
+    client, share_id = _operator_client(is_admin=True, role="editor")
+    with client:
+        relay = relocate.Relay(
+            client, "http://cp.test", "t", share_id, operator_admin=True
+        )
+    assert relay.owner == "owner" and relay.actor == "operator"
+    print(
+        "GREEN: --operator-admin accepts admin editor; DB owner check uses share owner, audit actor is operator"
+    )
+
+
+@pytest.mark.parametrize(
+    "is_admin,role",
+    [(False, "editor"), (True, "viewer"), (True, None)],
+)
+def test_operator_admin_refuses_non_admin_or_non_editor(is_admin, role):
+    client, share_id = _operator_client(is_admin=is_admin, role=role)
+    with client, pytest.raises(relocate.Refused):
+        relocate.Relay(client, "http://cp.test", "t", share_id, operator_admin=True)
+
+
+def test_operator_flag_with_owner_token_still_works():
+    client, share_id = _operator_client(is_admin=False, role=None, owner_flag=True)
+    with client:
+        relay = relocate.Relay(
+            client, "http://cp.test", "t", share_id, operator_admin=True
+        )
+    assert relay.actor == relay.owner == "owner"
+
+
 def test_offline_peer_negative_control_and_atomic_move(tmp_path):
     server, items = fixture()
     offline = relocate.load_doc(server.get_update())
@@ -472,6 +548,7 @@ def test_finish_resume_after_unknown_post_and_row_lock(postgres_engine):
 
         def __init__(self):
             self.owner = str(owner)
+            self.actor = str(owner)
 
         def snapshot(self):
             return doc.get_update()
