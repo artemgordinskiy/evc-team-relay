@@ -264,6 +264,11 @@ class CIRules(unittest.TestCase):
             self.assertTrue(selected(config, "pipeline", [], context(source, open_mrs="1")))
         self.assertTrue(selected(config, "pipeline", [], context("push", "main", open_mrs="1")))
         self.assertFalse(selected(config, "pipeline", [], context("push", open_mrs="1")))
+        # The MR may not exist yet when the push pipeline is decided.
+        self.assertFalse(selected(config, "pipeline", [], context("push")))
+        self.assertFalse(selected(config, "pipeline", [], context("push", before="0" * 40)))
+        self.assertTrue(selected(config, "pipeline", [], context("push", "main")))
+        self.assertTrue(selected(config, "pipeline", [], context()))
 
     def test_deploy_runtime_and_test_scope(self):
         skip = [

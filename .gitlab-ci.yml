@@ -44,7 +44,14 @@
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+    # A push to a non-default branch creates no pipeline, with or without an
+    # open MR. $CI_OPEN_MERGE_REQUESTS is evaluated at push time and misses the
+    # usual case (branch pushed seconds before `glab mr create`), so the push
+    # pipeline ran and the MR pipeline then repeated it on the same SHA.
+    # Measured 2026-10-13 over 24 h: 6 of 6 branch push pipelines duplicated an
+    # MR pipeline, 3.4 runner-hours on a fully busy shared runner. A branch
+    # without an MR gets CI from a draft MR or a manually started pipeline.
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
       when: never
     - if: $CI_COMMIT_BRANCH
 
