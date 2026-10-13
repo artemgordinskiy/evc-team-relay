@@ -1,10 +1,15 @@
 # Postgres backup container with mc (MinIO Client) for off-site mirroring
+
+# mc is copied from a pinned image instead of downloaded from a MinIO-hosted
+# URL (dl.min.io/client/mc/... now returns 410 Gone). Keep this default in sync
+# with MC_IMAGE in docker-compose.yml; override via the build arg / MC_IMAGE.
+ARG MC_IMAGE=pgsty/mc:RELEASE.2026-09-16T00-00-00Z@sha256:cfc83108c3abb371f8fb84d99c1fdc88f8c237e022409b0081fb7c0a3be634dd
+FROM ${MC_IMAGE} AS mc
+
 FROM postgres:16-alpine
 
-# Install bash and download mc (MinIO Client)
-RUN apk add --no-cache bash curl && \
-    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && \
-    chmod +x /usr/local/bin/mc
+RUN apk add --no-cache bash curl
+COPY --from=mc /usr/bin/mc /usr/local/bin/mc
 
 # Copy backup scripts
 COPY backup.sh /usr/local/bin/backup.sh
