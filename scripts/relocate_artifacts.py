@@ -92,8 +92,14 @@ def prepare(
     share_name: str,
     reverse: dict | None = None,
     extra_roots: tuple[str, ...] = (),
+    allow_unregistered: bool = False,
 ) -> dict:
-    """Pure planning: never mutates the supplied snapshot or index."""
+    """Pure planning: never mutates the supplied snapshot or index.
+
+    With ``allow_unregistered`` an indexed file that has no CRDT metadata is
+    moved in the SQL index only. Such files were uploaded through the API and no
+    client ever registered them, so there is no CRDT entry to move.
+    """
     doc = load_doc(snapshot)
     before = maps(doc)
     for root in extra_roots:
@@ -139,13 +145,24 @@ def prepare(
         if target == path:
             continue
         meta = before["filemeta_v0"].get(path)
-        if not meta:
+        if not meta and not allow_unregistered:
             raise Refused(f"Indexed file has no CRDT metadata: {path}")
+        if (
+            not meta
+            and next(i for i in items if i["path"] == path).get("type") == "folder"
+        ):
+            raise Refused(f"Unregistered folder entry cannot be moved: {path}")
+        if not meta and path in before["docs"]:
+            raise Refused(f"Unregistered file is in legacy docs map: {path}")
+        if not meta and any(target in values for values in before.values()):
+            raise Refused(f"CRDT destination collision: {target} (source {path})")
     for name, values in before.items():
         for path in values:
             target = destination(path)
             if target != path and target in values:
-                raise Refused(f"CRDT destination collision: {name}/{target}")
+                raise Refused(
+                    f"CRDT destination collision: {name}/{target} (source {path})"
+                )
     targets = [destination(item["path"]) for item in items]
     if len(targets) != len(set(targets)):
         raise Refused("Index destination collision")
@@ -449,6 +466,12 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use an administrator's token (editor member of the share) instead of the share owner's",
     )
+    result.add_argument(
+        "--allow-unregistered-files",
+        action="store_true",
+        help="Move indexed files that have no CRDT metadata in the index only "
+        "(default: refuse)",
+    )
     result.add_argument("--database-url-env", default="DATABASE_URL")
     result.add_argument(
         "--extra-root",
@@ -522,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
                         row.web_folder_items or [],
                         share_name,
                         extra_roots=tuple(args.extra_root),
+                        allow_unregistered=args.allow_unregistered_files,
                     )
                 )
             if args.resume or args.rollback:
@@ -544,6 +568,9 @@ def main(argv: list[str] | None = None) -> int:
                             row.web_folder_items,
                             share_name,
                             {v: k for k, v in journal["mapping"].items()},
+                            # The recorded after-state was just verified; files
+                            # moved in the index only have no CRDT entry to undo.
+                            allow_unregistered=True,
                         )
                         # Retain the new empty artifacts directory and inverse journal.
                         journal_rollback(directory, snapshot, plan, str(args.share_id))

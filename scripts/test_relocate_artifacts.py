@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import uuid
 from pathlib import Path
 
 import pycrdt
@@ -244,6 +245,101 @@ def test_collisions_and_missing_metadata_write_nothing():
         )
     with pytest.raises(relocate.Refused, match="Duplicate"):
         relocate.prepare(doc.get_update(), [*items, items[0]], "argus")
+
+
+def test_unregistered_files_refused_by_default_moved_in_index_only_with_flag():
+    doc, items = fixture()
+    api_file = {
+        "path": "deadbeef/api-upload.md",
+        "name": "api-upload.md",
+        "type": "doc",
+        "storage_key": "sync-uploads/share/api",
+        "sha256": "api-hash",
+    }
+    mixed = [*items, api_file]
+    before = doc.get_update()
+    with pytest.raises(relocate.Refused, match="no CRDT metadata"):
+        relocate.prepare(before, mixed, "argus")
+    plan = relocate.prepare(before, mixed, "argus", allow_unregistered=True)
+    assert doc.get_update() == before
+    # Registered files move in the CRDT and the index; the API upload moves in the
+    # index only and gains no CRDT entry.
+    after = plan["after_maps"]
+    assert "artifacts/deadbeef/note.md" in after["filemeta_v0"]
+    assert not any("api-upload" in p for p in after["filemeta_v0"])
+    assert [i["path"] for i in plan["after_index"]][-1] == (
+        "artifacts/deadbeef/api-upload.md"
+    )
+    assert {k: v for k, v in plan["after_index"][-1].items() if k != "path"} == {
+        k: v for k, v in api_file.items() if k != "path"
+    }
+    assert ["deadbeef/api-upload.md", "artifacts/deadbeef/api-upload.md"] in plan[
+        "moves"
+    ]
+    # Idempotent: a second pass over the moved state plans nothing.
+    server = relocate.load_doc(before)
+    server.apply_update(plan["update"])
+    repeat = relocate.prepare(
+        server.get_update(), plan["after_index"], "argus", allow_unregistered=True
+    )
+    assert repeat["moves"] == [] and repeat["after_index"] == plan["after_index"]
+    # Rollback restores the exact original index, files without metadata included.
+    rollback = relocate.prepare(
+        server.get_update(),
+        plan["after_index"],
+        "argus",
+        {v: k for k, v in plan["mapping"].items()},
+        allow_unregistered=True,
+    )
+    assert rollback["after_index"] == mixed
+
+
+def test_unregistered_folder_entry_refused_even_with_flag():
+    doc, items = fixture()
+    folder = {"path": "deadbeef/sub", "name": "sub", "type": "folder"}
+    with pytest.raises(relocate.Refused, match="Unregistered folder"):
+        relocate.prepare(
+            doc.get_update(), [*items, folder], "argus", allow_unregistered=True
+        )
+
+
+def test_docs_only_entry_refused_even_with_flag():
+    # A path without filemeta_v0 but present in the legacy docs map would still be
+    # moved in CRDT state by the map loop, so it is not "index-only" and is refused.
+    doc, items = fixture()
+    api_file = {"path": "deadbeef/legacy.md", "type": "doc"}
+    doc.get("docs", type=pycrdt.Map)["deadbeef/legacy.md"] = "legacy-id"
+    snapshot = doc.get_update()
+    with pytest.raises(relocate.Refused, match="legacy docs"):
+        relocate.prepare(snapshot, [*items, api_file], "argus", allow_unregistered=True)
+    assert doc.get_update() == snapshot
+
+
+def test_unregistered_flag_keeps_other_protections():
+    doc, items = fixture()
+    api_file = {"path": "deadbeef/api-upload.md", "type": "doc"}
+    meta = doc.get("filemeta_v0", type=pycrdt.Map)
+    meta["artifacts/deadbeef/api-upload.md"] = {
+        "type": "markdown",
+        "id": "twin",
+        "version": 0,
+    }
+    with pytest.raises(relocate.Refused, match="collision"):
+        relocate.prepare(
+            doc.get_update(), [*items, api_file], "argus", allow_unregistered=True
+        )
+    doc, items = fixture()
+    del doc.get("filemeta_v0", type=pycrdt.Map)["deadbeef"]
+    with pytest.raises(relocate.Refused, match="no CRDT ID"):
+        relocate.prepare(
+            doc.get_update(), [*items, api_file], "argus", allow_unregistered=True
+        )
+    assert relocate.parser().parse_args(["--share-id", str(uuid.uuid4())])
+    assert (
+        not relocate.parser()
+        .parse_args(["--share-id", str(uuid.uuid4())])
+        .allow_unregistered_files
+    )
 
 
 def test_selection_and_suffix():
