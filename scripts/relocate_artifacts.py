@@ -300,7 +300,14 @@ def journal_rollback(
 
 
 class Relay:
-    def __init__(self, client: httpx.Client, cp_url: str, jwt: str, share_id: str):
+    def __init__(
+        self,
+        client: httpx.Client,
+        cp_url: str,
+        jwt: str,
+        share_id: str,
+        operator_admin: bool = False,
+    ):
         self.client = client
         headers = {"Authorization": f"Bearer {jwt}"}
         me = client.get(f"{cp_url}/v1/auth/me", headers=headers)
@@ -308,9 +315,30 @@ class Relay:
         response = client.get(f"{cp_url}/v1/shares/{share_id}", headers=headers)
         response.raise_for_status()
         self.share = response.json()
-        self.owner = me.json()["id"]
-        if self.share["owner_user_id"] != self.owner or self.share["kind"] != "folder":
+        profile = me.json()
+        # `owner` is the share owner reported by the API (compared with the
+        # database row later); `actor` is the user the token belongs to.
+        self.owner = self.share["owner_user_id"]
+        self.actor = profile["id"]
+        if self.share["kind"] != "folder":
             raise Refused("A folder share's own user token is required")
+        if not operator_admin:
+            if self.owner != self.actor:
+                raise Refused("A folder share's own user token is required")
+        elif self.owner != self.actor:
+            if profile.get("is_admin") is not True:
+                raise Refused("--operator-admin requires an administrator account")
+            members = client.get(
+                f"{cp_url}/v1/shares/{share_id}/members", headers=headers
+            )
+            members.raise_for_status()
+            if not any(
+                member.get("user_id") == self.actor and member.get("role") == "editor"
+                for member in members.json()
+            ):
+                raise Refused(
+                    "--operator-admin requires editor membership on the share"
+                )
         response = client.post(
             f"{cp_url}/v1/tokens/relay",
             headers=headers,
@@ -401,7 +429,7 @@ def finish(
             audits.insert().values(
                 id=uuid.uuid4(),
                 action="share_updated",
-                actor_user_id=uuid.UUID(relay.owner),
+                actor_user_id=uuid.UUID(relay.actor),
                 target_share_id=key,
                 details={
                     "operation": "artifact_folder_relocation",
@@ -416,6 +444,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--share-id", required=True, type=uuid.UUID)
     result.add_argument("--cp-url", default="http://localhost:8000")
     result.add_argument("--token-env", default="TR_OWNER_TOKEN")
+    result.add_argument(
+        "--operator-admin",
+        action="store_true",
+        help="Use an administrator's token (editor member of the share) instead of the share owner's",
+    )
     result.add_argument("--database-url-env", default="DATABASE_URL")
     result.add_argument(
         "--extra-root",
@@ -443,9 +476,7 @@ def main(argv: list[str] | None = None) -> int:
         token = os.environ.get(args.token_env)
         database_url = os.environ.get(args.database_url_env)
         if not token or not database_url:
-            raise Refused(
-                "Owner token and database URL environment variables are required"
-            )
+            raise Refused("Token and database URL environment variables are required")
         engine = create_engine(database_url, hide_parameters=True)
         if (
             args.apply or args.resume or args.rollback
@@ -455,7 +486,13 @@ def main(argv: list[str] | None = None) -> int:
         shares = Table("shares", metadata, autoload_with=engine)
         audits = Table("audit_logs", metadata, autoload_with=engine)
         with httpx.Client(timeout=60, follow_redirects=False) as client:
-            relay = Relay(client, args.cp_url.rstrip("/"), token, str(args.share_id))
+            relay = Relay(
+                client,
+                args.cp_url.rstrip("/"),
+                token,
+                str(args.share_id),
+                operator_admin=args.operator_admin,
+            )
             share_path = relay.share["path"]
             write = args.apply or args.resume or args.rollback
             if (
@@ -538,6 +575,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"rollback: uv run scripts/relocate_artifacts.py --share-id {args.share_id} "
                     f"--cp-url {shlex.quote(args.cp_url)} --production-share {shlex.quote(share_path)} "
                     f"--token-env {shlex.quote(args.token_env)} --database-url-env {shlex.quote(args.database_url_env)} "
+                    f"{'--operator-admin ' if args.operator_admin else ''}"
                     f"--rollback {shlex.quote(str(args.backup_dir))}"
                 )
             with engine.begin() as connection:
