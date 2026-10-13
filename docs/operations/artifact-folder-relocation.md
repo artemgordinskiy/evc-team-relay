@@ -105,6 +105,41 @@ uv run scripts/relocate_artifacts.py --share-id "$ARGUS_SHARE_ID" --cp-url "$CP_
   --relay-data-dir /secure/relay-storage
 ```
 
+### Administrator mode (no share-owner token)
+
+When the share owner's token is not available, run with `--operator-admin`
+and a token of an administrator account (`is_admin` in `/v1/auth/me`) that is
+also an `editor` member of the share. Everything else is unchanged: dry-run by
+default, `--production-share`, backup, journal, resume and rollback. The owner
+check is replaced by comparing the database owner with the owner reported by
+the API, and the audit record names the operator as the actor. Without the flag
+a non-owner token is still refused. The rollback command printed by `--apply`
+includes the flag. Pass the same flag to `--resume` and `--rollback`.
+
+```sh
+uv run scripts/relocate_artifacts.py --share-id "$SHARE_ID" --cp-url "$CP_URL" --operator-admin
+```
+
+### Running from a container
+
+For a host without `uv` or `pg_dump`, build the runner once (set `PG_MAJOR` to
+the server's major version) and run it on the Docker network that reaches the
+database. Credentials are passed by variable name only, never as values.
+
+```sh
+docker build -f scripts/relocate_artifacts.Dockerfile --build-arg PG_MAJOR=16 \
+  -t relocate-artifacts .
+# TR_OWNER_TOKEN and DATABASE_URL must already be exported in the environment.
+docker run --rm --network "$COMPOSE_NETWORK" --user "$(id -u):$(id -g)" \
+  -e TR_OWNER_TOKEN -e DATABASE_URL \
+  -v /secure/backups:/backups -v /secure/relay-storage:/relay-data:ro \
+  relocate-artifacts --share-id "$SHARE_ID" --cp-url "$CP_URL" --operator-admin \
+  --backup-dir /backups/relocation-1 --relay-data-dir /relay-data --apply
+```
+
+Omit `--apply` (and the backup arguments) for a dry run. `DATABASE_URL` must be
+reachable from inside that network.
+
 The production-share argument is the exact API share path (use that path if it
 differs from `argus`). Reconnect the offline client only after `VERIFIED`. Check
 the actual vault: old folders absent, new folders present, no duplicate files.
