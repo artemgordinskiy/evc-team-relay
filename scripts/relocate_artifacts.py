@@ -86,6 +86,94 @@ def load_doc(snapshot: bytes) -> pycrdt.Doc:
     return doc
 
 
+def children(paths, root: str) -> list[str]:
+    return sorted(p for p in paths if p.startswith(root + "/"))
+
+
+def empty_placeholder(before: dict, indexed: set, target: str) -> bool:
+    """A bare folder record with no children and no index rows of its own."""
+    record = before["filemeta_v0"].get(target)
+    return bool(
+        record
+        and record.get("type") == "folder"
+        and target not in before["docs"]
+        and target not in indexed
+        and not children(before["filemeta_v0"], target)
+        and not children(before["docs"], target)
+        and not children(indexed, target)
+    )
+
+
+def describe_destination(before: dict, items: list[dict], source: str, target: str):
+    record = before["filemeta_v0"].get(target)
+    src = before["filemeta_v0"].get(source)
+    indexed = {i["path"] for i in items}
+    return (
+        f"destination type={record.get('type') if record else None} "
+        f"id={record.get('id') if record else None} "
+        f"in_docs={target in before['docs']} "
+        f"crdt_children={len(children(before['filemeta_v0'], target))} "
+        f"index_children={len(children(indexed, target))}; "
+        f"source type={src.get('type') if src else None} "
+        f"id={src.get('id') if src else None} "
+        f"in_docs={source in before['docs']} "
+        f"crdt_children={len(children(before['filemeta_v0'], source))} "
+        f"index_children={len(children(indexed, source))}"
+    )
+
+
+def duplicate_problem(before: dict, items: list[dict], source: str, target: str):
+    """Return None when every source entry has an identical copy at the target.
+
+    One uniform rule over the CRDT metadata, the docs map and the index: a
+    source path is removable only if the same set of maps holds it and its
+    copy, both have a CRDT record and (for files) an index row, the types match
+    in every map, and the sha256 values are present and equal.
+    """
+    meta = before["filemeta_v0"]
+    if (meta.get(target) or {}).get("type") != "folder":
+        return "destination is not a folder record"
+    by_path = {i["path"]: i for i in items}
+    if (meta.get(source) or {}).get("type") != "folder":
+        return f"source root {source} is not a folder record"
+    root_row = by_path.get(source)
+    if root_row and root_row.get("type") != "folder":
+        return f"source root {source} is a folder in the CRDT but a file in the index"
+    maps_ = {"filemeta_v0": meta, "docs": before["docs"], "index": by_path}
+    # "" is the root itself: it gets the same parity proof as its descendants.
+    rels = {""} | {
+        path[len(source) :]
+        for values in maps_.values()
+        for path in children(values, source)
+    }
+    for rel in sorted(rels):
+        path, twin = source + rel, target + rel
+        for name, values in maps_.items():
+            if (path in values) != (twin in values):
+                return f"{name}/{path} has no matching copy at the destination"
+        if path not in meta or twin not in meta:
+            return f"{path} has no CRDT record for it or its copy"
+        kind = meta[path].get("type")
+        if kind != meta[twin].get("type"):
+            return f"{path} differs in type from its copy"
+        row, twin_row = by_path.get(path), by_path.get(twin)
+        if kind == "folder":
+            if row and (
+                row.get("type") != "folder" or twin_row.get("type") != "folder"
+            ):
+                return f"{path} is a folder in the CRDT but a file in the index"
+            continue
+        if not row:
+            return f"{path} has no index row to verify its sha256"
+        if row.get("type") == "folder" or twin_row.get("type") == "folder":
+            return f"{path} is a file in the CRDT but a folder in the index"
+        if row.get("type") != twin_row.get("type"):
+            return f"{path} differs in index type from its copy"
+        if not row.get("sha256") or row.get("sha256") != twin_row.get("sha256"):
+            return f"{path} differs in sha256 from its copy"
+    return None
+
+
 def prepare(
     snapshot: bytes,
     items: list[dict],
@@ -93,8 +181,16 @@ def prepare(
     reverse: dict | None = None,
     extra_roots: tuple[str, ...] = (),
     allow_unregistered: bool = False,
+    merge_empty_destinations: bool = False,
+    remove_duplicates: bool = False,
 ) -> dict:
     """Pure planning: never mutates the supplied snapshot or index.
+
+    ``merge_empty_destinations`` lets a root move onto an existing empty folder
+    record at ``artifacts/<root>`` (no children in the CRDT or the index): the
+    empty record is dropped and the source folder keeps its ID.
+    ``remove_duplicates`` removes a legacy root whose ``artifacts/<root>`` copy
+    already holds every file with an identical sha256, in the CRDT and the index.
 
     With ``allow_unregistered`` an indexed file that has no CRDT metadata is
     moved in the SQL index only. Such files were uploaded through the API and no
@@ -124,6 +220,49 @@ def prepare(
         if selected(p.split("/")[0], share_name, extra_roots)
     }
     mapping = reverse or {root: f"artifacts/{root}" for root in sorted(roots)}
+    merged: list[str] = []
+    duplicates: dict[str, list[str]] = {"crdt": [], "index": []}
+    if not reverse:
+        problems = []
+        for source in sorted(mapping):
+            target = mapping[source]
+            exists = (
+                target in before["filemeta_v0"]
+                or target in before["docs"]
+                or target in indexed
+                or any(path.startswith(target + "/") for path in paths | indexed)
+            )
+            if not exists:
+                continue
+            reason = None
+            if merge_empty_destinations and empty_placeholder(before, indexed, target):
+                merged.append(target)
+                continue
+            if remove_duplicates:
+                reason = duplicate_problem(before, items, source, target)
+                if reason is None:
+                    del mapping[source]
+                    duplicates["crdt"] += [
+                        p
+                        for values in before.values()
+                        for p in values
+                        if p == source or p.startswith(source + "/")
+                    ]
+                    duplicates["index"] += [
+                        i["path"]
+                        for i in items
+                        if i["path"] == source or i["path"].startswith(source + "/")
+                    ]
+                    continue
+            detail = describe_destination(before, items, source, target)
+            problems.append(
+                f"{target} (source {source}): {detail}"
+                + (f"; not a verified duplicate: {reason}" if reason else "")
+            )
+        if problems:
+            raise Refused("CRDT destination collision: " + " | ".join(problems[:20]))
+        duplicates["crdt"] = sorted(set(duplicates["crdt"]))
+    dropped = set(duplicates["index"])
 
     def destination(path: str) -> str:
         for source, target in mapping.items():
@@ -159,14 +298,14 @@ def prepare(
     for name, values in before.items():
         for path in values:
             target = destination(path)
-            if target != path and target in values:
+            if target != path and target in values and target not in merged:
                 raise Refused(
                     f"CRDT destination collision: {name}/{target} (source {path})"
                 )
-    targets = [destination(item["path"]) for item in items]
+    targets = [destination(i["path"]) for i in items if i["path"] not in dropped]
     if len(targets) != len(set(targets)):
         raise Refused("Index destination collision")
-    updated = copy.deepcopy(items)
+    updated = copy.deepcopy([i for i in items if i["path"] not in dropped])
     moves = []
     for item in updated:
         old = item["path"]
@@ -177,7 +316,15 @@ def prepare(
     with doc.transaction():
         for name, values in before.items():
             root = doc.get(name, type=pycrdt.Map)
+            for path in duplicates["crdt"]:
+                if path in values:
+                    del root[path]
+            for target in merged:
+                if target in values:
+                    del root[target]
             for path, value in values.items():
+                if path in duplicates["crdt"]:
+                    continue
                 target = destination(path)
                 if target != path:
                     root[target] = value
@@ -195,6 +342,8 @@ def prepare(
         "after_index": updated,
         "mapping": mapping,
         "moves": moves,
+        "merged_empty_destinations": merged,
+        "removed_duplicates": duplicates,
         "update": doc.get_update(state),
     }
 
@@ -472,6 +621,18 @@ def parser() -> argparse.ArgumentParser:
         help="Move indexed files that have no CRDT metadata in the index only "
         "(default: refuse)",
     )
+    result.add_argument(
+        "--merge-empty-destination-folders",
+        action="store_true",
+        help="Let a root move onto an existing EMPTY artifacts/<root> folder record "
+        "(default: refuse)",
+    )
+    result.add_argument(
+        "--remove-duplicate-roots",
+        action="store_true",
+        help="Remove a legacy root whose artifacts/<root> copy holds every file with "
+        "an identical sha256 (default: refuse)",
+    )
     result.add_argument("--database-url-env", default="DATABASE_URL")
     result.add_argument(
         "--extra-root",
@@ -546,6 +707,8 @@ def main(argv: list[str] | None = None) -> int:
                         share_name,
                         extra_roots=tuple(args.extra_root),
                         allow_unregistered=args.allow_unregistered_files,
+                        merge_empty_destinations=args.merge_empty_destination_folders,
+                        remove_duplicates=args.remove_duplicate_roots,
                     )
                 )
             if args.resume or args.rollback:
@@ -561,6 +724,14 @@ def main(argv: list[str] | None = None) -> int:
                     ):
                         raise Refused(
                             "Share changed after relocation; automatic rollback refused"
+                        )
+                    elif journal.get("merged_empty_destinations") or any(
+                        journal.get("removed_duplicates", {}).values()
+                    ):
+                        raise Refused(
+                            "This relocation merged or removed entries; automatic "
+                            "rollback cannot restore them. Restore the backup "
+                            "(database.dump, folder-before.yjs) instead"
                         )
                     else:
                         plan = prepare(
@@ -579,6 +750,12 @@ def main(argv: list[str] | None = None) -> int:
                     plan = journal
             for old, new in plan["moves"]:
                 print(f"{share_name}\t{old}\t{new}")
+            for target in plan.get("merged_empty_destinations", []):
+                print(f"{share_name}\tmerge-empty\t{target}")
+            for path in plan.get("removed_duplicates", {}).get("crdt", []):
+                print(f"{share_name}\tremove-duplicate-crdt\t{path}")
+            for path in plan.get("removed_duplicates", {}).get("index", []):
+                print(f"{share_name}\tremove-duplicate-index\t{path}")
             print(
                 f"files_before={sum(i.get('type') != 'folder' for i in plan['before_index'])} "
                 f"files_after={sum(i.get('type') != 'folder' for i in plan['after_index'])} "

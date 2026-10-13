@@ -41,6 +41,29 @@ apply and rollback alike, and does not relax any other check; an indexed folder 
 file without metadata that is listed in the legacy `docs` map, is still refused. Run the dry-run
 with the flag first and review which files are index-only. Collisions,
 invalid paths, mismatching legacy IDs, and unexpected changes fail before writes.
+### Destination already exists
+
+When `artifacts/<root>` already exists, the dry-run refuses and prints what it
+found: the destination's type and ID, whether it is in the legacy `docs` map,
+how many CRDT entries and index rows sit under it, and the same counts for the
+source root. Two explicit flags handle the safe cases; both are off by default
+and every other collision still fails.
+
+- `--merge-empty-destination-folders`: the destination is a bare folder record
+  with no children in the CRDT or the index. The record is dropped and the
+  source folder moves onto it, keeping the source folder's ID.
+- `--remove-duplicate-roots`: the destination already holds a copy of every
+  entry under the source root. Each source file must have a copy with the same
+  type in the CRDT and an index row with the same non-empty sha256. The source
+  entries are then removed together, in one CRDT transaction plus the index
+  update, so a client cannot bring the old folder back from a stale index row.
+  The copies at `artifacts/<root>` keep their IDs.
+
+These two modes delete or replace entries, so automatic `--rollback` is refused
+for them. Recover from the backup directory (`database.dump` and
+`folder-before.yjs`) instead. Dry-run lists each change as `merge-empty`,
+`remove-duplicate-crdt` or `remove-duplicate-index`; review that list first.
+
 The migration is a maintenance operation: pause artifact producers and clients
 that change folder metadata until both representations have been verified.
 Offline content edits are supported; concurrent offline structural edits are

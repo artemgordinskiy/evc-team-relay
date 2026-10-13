@@ -315,6 +315,165 @@ def test_docs_only_entry_refused_even_with_flag():
     assert doc.get_update() == snapshot
 
 
+def placeholder_fixture(children_in_crdt=False, children_in_index=False):
+    doc, items = fixture()
+    meta = doc.get("filemeta_v0", type=pycrdt.Map)
+    with doc.transaction():
+        meta["artifacts"] = {"type": "folder", "id": "artifacts-id", "version": 0}
+        meta["artifacts/deadbeef"] = {"type": "folder", "id": "empty-id", "version": 0}
+        if children_in_crdt:
+            meta["artifacts/deadbeef/x.md"] = {
+                "type": "markdown",
+                "id": "x",
+                "version": 0,
+            }
+    if children_in_index:
+        items = [*items, {"path": "artifacts/deadbeef/x.md", "type": "doc"}]
+    return doc, items
+
+
+def test_empty_destination_folder_refused_by_default_with_diagnostics():
+    doc, items = placeholder_fixture()
+    snapshot = doc.get_update()
+    with pytest.raises(relocate.Refused) as caught:
+        relocate.prepare(snapshot, items, "argus")
+    message = str(caught.value)
+    assert "collision" in message and "artifacts/deadbeef" in message
+    assert "destination type=folder id=empty-id" in message
+    assert "crdt_children=0 index_children=0" in message
+    assert "source type=folder id=folder-id in_docs=False" in message
+    assert "crdt_children=2 index_children=2" in message
+    assert doc.get_update() == snapshot
+
+
+def test_empty_destination_folder_merged_with_flag_keeping_source_id():
+    doc, items = placeholder_fixture()
+    before = doc.get_update()
+    plan = relocate.prepare(before, items, "argus", merge_empty_destinations=True)
+    assert doc.get_update() == before
+    after = plan["after_maps"]["filemeta_v0"]
+    assert after["artifacts/deadbeef"]["id"] == "folder-id"
+    assert "deadbeef" not in after and "artifacts/deadbeef/note.md" in after
+    assert plan["merged_empty_destinations"] == ["artifacts/deadbeef"]
+    assert [i["path"] for i in plan["after_index"]] == [
+        "artifacts/deadbeef/note.md",
+        "artifacts/deadbeef/file.bin",
+    ]
+    # The merged state is a fixed point: nothing further to move.
+    server = relocate.load_doc(before)
+    server.apply_update(plan["update"])
+    repeat = relocate.prepare(
+        server.get_update(),
+        plan["after_index"],
+        "argus",
+        merge_empty_destinations=True,
+    )
+    assert repeat["moves"] == []
+
+
+@pytest.mark.parametrize("crdt,index", [(True, False), (False, True)])
+def test_non_empty_destination_folder_refused_even_with_merge_flag(crdt, index):
+    doc, items = placeholder_fixture(crdt, index)
+    with pytest.raises(relocate.Refused, match="collision"):
+        relocate.prepare(
+            doc.get_update(), items, "argus", merge_empty_destinations=True
+        )
+
+
+def duplicate_fixture(sha="hash"):
+    doc, items = fixture()
+    meta = doc.get("filemeta_v0", type=pycrdt.Map)
+    legacy = doc.get("docs", type=pycrdt.Map)
+    with doc.transaction():
+        meta["artifacts"] = {"type": "folder", "id": "artifacts-id", "version": 0}
+        meta["artifacts/deadbeef"] = {"type": "folder", "id": "copy-id", "version": 0}
+        meta["artifacts/deadbeef/note.md"] = {
+            "type": "markdown",
+            "id": "copy-note",
+            "version": 0,
+        }
+        legacy["artifacts/deadbeef/note.md"] = "copy-note"
+        meta["artifacts/deadbeef/file.bin"] = {
+            "type": "file",
+            "id": "copy-bin",
+            "version": 0,
+        }
+    copies = [
+        {**items[0], "path": "artifacts/deadbeef/note.md", "sha256": sha},
+        {**items[1], "path": "artifacts/deadbeef/file.bin"},
+    ]
+    return doc, [*items, *copies]
+
+
+def test_duplicate_root_refused_by_default():
+    doc, items = duplicate_fixture()
+    with pytest.raises(relocate.Refused, match="collision"):
+        relocate.prepare(doc.get_update(), items, "argus")
+
+
+def test_duplicate_root_removed_in_crdt_and_index_when_copies_identical():
+    doc, items = duplicate_fixture()
+    before = doc.get_update()
+    plan = relocate.prepare(before, items, "argus", remove_duplicates=True)
+    assert doc.get_update() == before
+    after = plan["after_maps"]
+    assert not any(p.split("/")[0] == "deadbeef" for p in after["filemeta_v0"])
+    assert not any(p.split("/")[0] == "deadbeef" for p in after["docs"])
+    # The copies keep their IDs, and unrelated entries are untouched.
+    assert after["filemeta_v0"]["artifacts/deadbeef/note.md"]["id"] == "copy-note"
+    assert "specs" in after["filemeta_v0"]
+    assert [i["path"] for i in plan["after_index"]] == [
+        "artifacts/deadbeef/note.md",
+        "artifacts/deadbeef/file.bin",
+    ]
+    assert plan["moves"] == []
+    assert "deadbeef/note.md" in plan["removed_duplicates"]["crdt"]
+    assert "deadbeef/file.bin" in plan["removed_duplicates"]["index"]
+    server = relocate.load_doc(before)
+    server.apply_update(plan["update"])
+    repeat = relocate.prepare(
+        server.get_update(), plan["after_index"], "argus", remove_duplicates=True
+    )
+    assert repeat["after_index"] == plan["after_index"]
+    assert repeat["removed_duplicates"] == {"crdt": [], "index": []}
+
+
+def test_duplicate_root_kept_when_a_copy_differs_or_is_missing():
+    doc, items = duplicate_fixture(sha="other-hash")
+    with pytest.raises(relocate.Refused, match="differs in sha256"):
+        relocate.prepare(doc.get_update(), items, "argus", remove_duplicates=True)
+    doc, items = duplicate_fixture()
+    del doc.get("filemeta_v0", type=pycrdt.Map)["artifacts/deadbeef/file.bin"]
+    with pytest.raises(relocate.Refused, match="no matching copy at the destination"):
+        relocate.prepare(doc.get_update(), items, "argus", remove_duplicates=True)
+    doc, items = duplicate_fixture()
+    with pytest.raises(relocate.Refused, match="no matching copy at the destination"):
+        relocate.prepare(doc.get_update(), items[:3], "argus", remove_duplicates=True)
+
+
+def test_duplicate_root_refused_when_source_file_has_no_index_row():
+    doc, items = duplicate_fixture()
+    unindexed = [i for i in items if i["path"] != "deadbeef/note.md"]
+    with pytest.raises(relocate.Refused, match="no matching copy|no index row"):
+        relocate.prepare(doc.get_update(), unindexed, "argus", remove_duplicates=True)
+
+
+def test_duplicate_root_refused_when_index_row_is_typed_as_folder():
+    # A folder-typed index row must not bypass the sha256 proof for a CRDT file.
+    doc, items = duplicate_fixture()
+    typed = [
+        {**i, "type": "folder"} if i["path"] == "deadbeef/note.md" else i for i in items
+    ]
+    with pytest.raises(relocate.Refused, match="folder in the index"):
+        relocate.prepare(doc.get_update(), typed, "argus", remove_duplicates=True)
+
+
+def test_merge_and_duplicate_flags_default_off():
+    args = relocate.parser().parse_args(["--share-id", str(uuid.uuid4())])
+    assert not args.merge_empty_destination_folders
+    assert not args.remove_duplicate_roots
+
+
 def test_unregistered_flag_keeps_other_protections():
     doc, items = fixture()
     api_file = {"path": "deadbeef/api-upload.md", "type": "doc"}
@@ -721,3 +880,113 @@ def postgres_engine():
     metadata.reflect(bind=engine)
     metadata.drop_all(engine)
     engine.dispose()
+
+
+def test_duplicate_root_refused_when_destination_index_twin_is_a_folder():
+    # A folder-typed destination row must not satisfy the sha256 match.
+    doc, items = duplicate_fixture()
+    typed = [
+        {**i, "type": "folder"} if i["path"] == "artifacts/deadbeef/note.md" else i
+        for i in items
+    ]
+    with pytest.raises(relocate.Refused, match="folder in the index"):
+        relocate.prepare(doc.get_update(), typed, "argus", remove_duplicates=True)
+
+
+def test_duplicate_root_refused_when_index_only_source_has_no_crdt_copy():
+    # An index-only source row with a matching destination index row must not
+    # pass: the CRDT type of the copy cannot be verified.
+    doc, items = duplicate_fixture()
+    source = items[0]["path"].split("/")[0]
+    extra = [
+        {**items[0], "path": f"{source}/ghost.md", "sha256": "same"},
+        {**items[0], "path": "artifacts/deadbeef/ghost.md", "sha256": "same"},
+    ]
+    with pytest.raises(relocate.Refused, match="no CRDT record"):
+        relocate.prepare(
+            doc.get_update(),
+            [*items, *extra],
+            "argus",
+            allow_unregistered=True,
+            remove_duplicates=True,
+        )
+
+
+def test_duplicate_root_refused_when_docs_only_source_has_no_crdt_record():
+    # A docs-map entry without file metadata must not be removed on the strength
+    # of a same-path entry at the destination.
+    doc, items = duplicate_fixture()
+    source = items[0]["path"].split("/")[0]
+    legacy = doc.get("docs", type=pycrdt.Map)
+    with doc.transaction():
+        legacy[f"{source}/ghost.md"] = "ghost-src"
+        legacy["artifacts/deadbeef/ghost.md"] = "ghost-dst"
+    with pytest.raises(relocate.Refused, match="no CRDT record"):
+        relocate.prepare(doc.get_update(), items, "argus", remove_duplicates=True)
+
+
+def test_duplicate_root_refused_when_index_twin_has_a_different_type():
+    # Same sha256 but a differently typed index twin is not an identical copy.
+    doc, items = duplicate_fixture()
+    typed = [
+        {**i, "type": "other"} if i["path"] == "artifacts/deadbeef/note.md" else i
+        for i in items
+    ]
+    with pytest.raises(relocate.Refused, match="differs in index type"):
+        relocate.prepare(doc.get_update(), typed, "argus", remove_duplicates=True)
+
+
+def test_duplicate_root_refused_when_source_root_is_not_a_folder():
+    # The selected root itself must be verified, not only its descendants.
+    doc, items = duplicate_fixture()
+    source = items[0]["path"].split("/")[0]
+    meta = doc.get("filemeta_v0", type=pycrdt.Map)
+    with doc.transaction():
+        meta[source] = {"type": "file", "id": "root-id", "version": 0}
+    with pytest.raises(relocate.Refused, match="not a folder record"):
+        relocate.prepare(doc.get_update(), items, "argus", remove_duplicates=True)
+
+
+def test_duplicate_root_refused_when_source_root_index_row_is_a_file():
+    doc, items = duplicate_fixture()
+    source = items[0]["path"].split("/")[0]
+    rows = [*items, {**items[0], "path": source, "type": "file", "sha256": "x"}]
+    with pytest.raises(relocate.Refused, match="source root"):
+        relocate.prepare(
+            doc.get_update(),
+            rows,
+            "argus",
+            allow_unregistered=True,
+            remove_duplicates=True,
+        )
+
+
+def test_duplicate_root_refused_when_root_index_row_has_no_destination_twin():
+    doc, items = duplicate_fixture()
+    source = items[0]["path"].split("/")[0]
+    rows = [*items, {**items[0], "path": source, "type": "folder", "sha256": None}]
+    with pytest.raises(relocate.Refused, match="no matching copy"):
+        relocate.prepare(
+            doc.get_update(),
+            rows,
+            "argus",
+            allow_unregistered=True,
+            remove_duplicates=True,
+        )
+
+
+def test_duplicate_root_refused_when_root_docs_entry_has_no_destination_twin():
+    doc, items = duplicate_fixture()
+    source = items[0]["path"].split("/")[0]
+    with doc.transaction():
+        doc.get("docs", type=pycrdt.Map)[source] = "root-doc"
+    with pytest.raises(relocate.Refused, match="no matching copy|ID mismatch"):
+        relocate.prepare(doc.get_update(), items, "argus", remove_duplicates=True)
+
+
+def test_index_only_row_at_destination_root_is_a_collision():
+    doc, items = fixture()
+    source = items[0]["path"].split("/")[0]
+    rows = [*items, {**items[0], "path": f"artifacts/{source}", "type": "folder"}]
+    with pytest.raises(relocate.Refused, match="collision"):
+        relocate.prepare(doc.get_update(), rows, "argus", allow_unregistered=True)
