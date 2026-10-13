@@ -30,8 +30,16 @@ it checks the database owner against the authenticated owner and records a
 `share_updated` audit entry. It does not create keys or change integrations.
 
 Before any write, every selected indexed file must have metadata at its
-source path. Missing metadata is a hard failure: downloading a
-file does not prove that an Obsidian client has registered its GUID. Collisions,
+source path. By default missing metadata is a hard failure: downloading a
+file does not prove that an Obsidian client has registered its GUID.
+
+Files uploaded through the API (indexed, but never registered by a client)
+have no metadata. Pass `--allow-unregistered-files` to relocate them: only
+their database index paths move, while folders and files that do have metadata
+move in the CRDT as usual. The flag is off by default, applies to dry-run,
+apply and rollback alike, and does not relax any other check; an indexed folder without metadata, or a
+file without metadata that is listed in the legacy `docs` map, is still refused. Run the dry-run
+with the flag first and review which files are index-only. Collisions,
 invalid paths, mismatching legacy IDs, and unexpected changes fail before writes.
 The migration is a maintenance operation: pause artifact producers and clients
 that change folder metadata until both representations have been verified.
