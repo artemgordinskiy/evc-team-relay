@@ -59,7 +59,20 @@ and every other collision still fails.
   update, so a client cannot bring the old folder back from a stale index row.
   The copies at `artifacts/<root>` keep their IDs.
 
-These two modes delete or replace entries, so automatic `--rollback` is refused
+- `--merge-destination-folders`: the destination already holds entries of its
+  own. Each source entry is compared with the entry at the same relative path:
+  entries with no counterpart move into `artifacts/<root>`; a pair with the same
+  type and the same non-empty sha256 is a duplicate and is removed from the
+  source side in the same CRDT transaction and index update; a pair that
+  differs, or cannot be proven identical, refuses the whole root and is listed
+  as `conflicts: <path>: <reason>`. Nothing is overwritten. The destination
+  folder record, if any, is replaced by the source folder's record (the source
+  ID is kept); a destination that has its own legacy-docs or index entry is
+  refused. Index-only files (uploaded through the API) are compared by index
+  row, and only with `--allow-unregistered-files`. Without any flag the
+  collision message also reports `overlap identical=N conflicting=M`.
+
+These modes delete or replace entries, so automatic `--rollback` is refused
 for them. Recover from the backup directory (`database.dump` and
 `folder-before.yjs`) instead. Dry-run lists each change as `merge-empty`,
 `remove-duplicate-crdt` or `remove-duplicate-index`; review that list first.

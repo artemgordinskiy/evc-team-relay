@@ -990,3 +990,123 @@ def test_index_only_row_at_destination_root_is_a_collision():
     rows = [*items, {**items[0], "path": f"artifacts/{source}", "type": "folder"}]
     with pytest.raises(relocate.Refused, match="collision"):
         relocate.prepare(doc.get_update(), rows, "argus", allow_unregistered=True)
+
+
+def merge_fixture(dest_sha="hash"):
+    """Destination holds a copy of note.md and file.bin, plus a file of its own."""
+    doc, items = duplicate_fixture(sha=dest_sha)
+    meta = doc.get("filemeta_v0", type=pycrdt.Map)
+    with doc.transaction():
+        meta["deadbeef/extra.bin"] = {"type": "file", "id": "extra-id", "version": 0}
+        meta["artifacts/deadbeef/own.bin"] = {
+            "type": "file",
+            "id": "own-id",
+            "version": 0,
+        }
+    asset = items[1]
+    rows = [
+        *items,
+        {**asset, "path": "deadbeef/extra.bin", "sha256": "extra-hash"},
+        {**asset, "path": "artifacts/deadbeef/own.bin", "sha256": "own-hash"},
+    ]
+    return doc, rows
+
+
+def test_nonempty_destination_refused_by_default_with_overlap_diagnostics():
+    doc, items = merge_fixture()
+    with pytest.raises(relocate.Refused, match="collision.*overlap identical=") as e:
+        relocate.prepare(doc.get_update(), items, "argus")
+    assert "conflicting=0" in str(e.value)
+
+
+def test_merge_destinations_moves_unpaired_and_drops_identical_pairs():
+    doc, items = merge_fixture()
+    plan = relocate.prepare(doc.get_update(), items, "argus", merge_destinations=True)
+    after = plan["after_maps"]["filemeta_v0"]
+    # source-only file moved in, destination-only file untouched, duplicates gone
+    assert "artifacts/deadbeef/extra.bin" in after
+    assert after["artifacts/deadbeef/own.bin"]["id"] == "own-id"
+    assert after["artifacts/deadbeef"]["id"] == "folder-id"  # source folder id kept
+    assert not [p for p in after if p.startswith("deadbeef")]
+    assert after["artifacts/deadbeef/note.md"]["id"] == "copy-note"
+    paths = {i["path"] for i in plan["after_index"]}
+    assert "artifacts/deadbeef/extra.bin" in paths
+    assert "artifacts/deadbeef/own.bin" in paths
+    assert not [p for p in paths if p.startswith("deadbeef")]
+    # second run on the result finds nothing left to move
+    moved = relocate.load_doc(doc.get_update())
+    moved.apply_update(plan["update"])
+    again = relocate.prepare(
+        moved.get_update(), plan["after_index"], "argus", merge_destinations=True
+    )
+    assert again["moves"] == []
+    assert again["removed_duplicates"] == {"crdt": [], "index": []}
+
+
+def test_merge_destinations_refuses_same_path_with_different_content():
+    doc, items = merge_fixture(dest_sha="other-hash")
+    with pytest.raises(relocate.Refused, match="conflicts: note.md.*differs in sha256"):
+        relocate.prepare(doc.get_update(), items, "argus", merge_destinations=True)
+
+
+def test_merge_destinations_lists_every_conflicting_path():
+    doc, items = merge_fixture()
+    meta = doc.get("filemeta_v0", type=pycrdt.Map)
+    rows = list(items)
+    with doc.transaction():
+        for i in range(8):
+            for prefix in ("deadbeef", "artifacts/deadbeef"):
+                meta[f"{prefix}/c{i}.bin"] = {"type": "file", "id": f"{prefix}-{i}"}
+    for i in range(8):
+        for prefix, sha in (("deadbeef", "a"), ("artifacts/deadbeef", "b")):
+            rows.append({**items[1], "path": f"{prefix}/c{i}.bin", "sha256": sha})
+    with pytest.raises(relocate.Refused) as e:
+        relocate.prepare(doc.get_update(), rows, "argus", merge_destinations=True)
+    for i in range(8):
+        assert f"c{i}.bin" in str(e.value)
+
+
+def test_merge_destinations_refuses_destination_with_docs_entry():
+    doc, items = merge_fixture()
+    with doc.transaction():
+        doc.get("docs", type=pycrdt.Map)["artifacts/deadbeef"] = "copy-id"
+    with pytest.raises(relocate.Refused, match="own docs or index entry"):
+        relocate.prepare(doc.get_update(), items, "argus", merge_destinations=True)
+
+
+def test_merge_destinations_handles_index_only_destination_without_crdt_record():
+    # Destination has no CRDT folder record, only API-uploaded index rows.
+    doc, items = fixture()
+    asset = items[1]
+    rows = [
+        *items,
+        {**asset, "path": "artifacts/deadbeef/file.bin"},  # same sha as source
+        {**asset, "path": "artifacts/deadbeef/own.bin", "sha256": "own-hash"},
+    ]
+    with pytest.raises(relocate.Refused, match="collision"):
+        relocate.prepare(doc.get_update(), rows, "argus", allow_unregistered=True)
+    # file.bin is registered in the CRDT at the source only: a registered/unregistered
+    # pair is not provably identical, so the root is refused rather than merged.
+    with pytest.raises(relocate.Refused, match="no matching copy"):
+        relocate.prepare(
+            doc.get_update(),
+            rows,
+            "argus",
+            allow_unregistered=True,
+            merge_destinations=True,
+        )
+    # Unregistered on both sides with equal sha256: identical, merged in the index.
+    meta = doc.get("filemeta_v0", type=pycrdt.Map)
+    with doc.transaction():
+        del meta["deadbeef/file.bin"]
+    plan = relocate.prepare(
+        doc.get_update(),
+        rows,
+        "argus",
+        allow_unregistered=True,
+        merge_destinations=True,
+    )
+    paths = {i["path"] for i in plan["after_index"]}
+    assert "artifacts/deadbeef/own.bin" in paths
+    assert "deadbeef/file.bin" not in paths
+    assert "deadbeef/file.bin" in plan["removed_duplicates"]["index"]

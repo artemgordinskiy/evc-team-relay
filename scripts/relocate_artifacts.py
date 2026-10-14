@@ -147,31 +147,91 @@ def duplicate_problem(before: dict, items: list[dict], source: str, target: str)
         for path in children(values, source)
     }
     for rel in sorted(rels):
-        path, twin = source + rel, target + rel
-        for name, values in maps_.items():
-            if (path in values) != (twin in values):
-                return f"{name}/{path} has no matching copy at the destination"
-        if path not in meta or twin not in meta:
-            return f"{path} has no CRDT record for it or its copy"
-        kind = meta[path].get("type")
-        if kind != meta[twin].get("type"):
-            return f"{path} differs in type from its copy"
-        row, twin_row = by_path.get(path), by_path.get(twin)
-        if kind == "folder":
-            if row and (
-                row.get("type") != "folder" or twin_row.get("type") != "folder"
-            ):
-                return f"{path} is a folder in the CRDT but a file in the index"
-            continue
-        if not row:
-            return f"{path} has no index row to verify its sha256"
-        if row.get("type") == "folder" or twin_row.get("type") == "folder":
-            return f"{path} is a file in the CRDT but a folder in the index"
+        reason = pair_problem(before, by_path, source + rel, target + rel)
+        if reason:
+            return reason
+    return None
+
+
+def pair_problem(
+    before: dict, by_path: dict, path: str, twin: str, allow_unregistered=False
+):
+    """Return None when ``path`` and ``twin`` are provably identical entries."""
+    meta = before["filemeta_v0"]
+    maps_ = {"filemeta_v0": meta, "docs": before["docs"], "index": by_path}
+    for name, values in maps_.items():
+        if (path in values) != (twin in values):
+            return f"{name}/{path} has no matching copy at the destination"
+    row, twin_row = by_path.get(path), by_path.get(twin)
+    if (
+        allow_unregistered
+        and path not in meta
+        and path not in before["docs"]
+        and row
+        and twin_row
+    ):
+        # Index-only files (uploaded through the API): compare the index rows.
+        if "folder" in (row.get("type"), twin_row.get("type")):
+            return f"{path} is an unregistered folder entry"
         if row.get("type") != twin_row.get("type"):
             return f"{path} differs in index type from its copy"
         if not row.get("sha256") or row.get("sha256") != twin_row.get("sha256"):
             return f"{path} differs in sha256 from its copy"
+        return None
+    if path not in meta or twin not in meta:
+        return f"{path} has no CRDT record for it or its copy"
+    kind = meta[path].get("type")
+    if kind != meta[twin].get("type"):
+        return f"{path} differs in type from its copy"
+    if kind == "folder":
+        if row and (row.get("type") != "folder" or twin_row.get("type") != "folder"):
+            return f"{path} is a folder in the CRDT but a file in the index"
+        return None
+    if not row:
+        return f"{path} has no index row to verify its sha256"
+    if row.get("type") == "folder" or twin_row.get("type") == "folder":
+        return f"{path} is a file in the CRDT but a folder in the index"
+    if row.get("type") != twin_row.get("type"):
+        return f"{path} differs in index type from its copy"
+    if not row.get("sha256") or row.get("sha256") != twin_row.get("sha256"):
+        return f"{path} differs in sha256 from its copy"
     return None
+
+
+def merge_plan(
+    before: dict, items: list[dict], source: str, target: str, allow_unregistered: bool
+) -> dict:
+    """Classify every source entry against ``target``: move, duplicate or conflict.
+
+    Entries with no counterpart at the target move as usual. Entries whose
+    counterpart is provably identical (see ``pair_problem``) are removed from
+    the source side. Anything else is a conflict and nothing is overwritten.
+    """
+    meta = before["filemeta_v0"]
+    by_path = {i["path"]: i for i in items}
+    plan = {"crdt": [], "index": [], "conflicts": [], "problem": None}
+    record = meta.get(target)
+    if record and record.get("type") != "folder":
+        plan["problem"] = "destination is not a folder record"
+    elif target in before["docs"] or target in by_path:
+        plan["problem"] = "destination has its own docs or index entry"
+    elif (meta.get(source) or {}).get("type") != "folder":
+        plan["problem"] = f"source root {source} is not a folder record"
+    maps_ = {"filemeta_v0": meta, "docs": before["docs"], "index": by_path}
+    for rel in sorted(
+        {p[len(source) :] for v in maps_.values() for p in children(v, source)}
+    ):
+        path, twin = source + rel, target + rel
+        if not any(twin in values for values in maps_.values()):
+            continue
+        reason = pair_problem(before, by_path, path, twin, allow_unregistered)
+        if reason:
+            plan["conflicts"].append(f"{rel[1:]}: {reason}")
+            continue
+        plan["crdt"] += [path for v in (meta, before["docs"]) if path in v]
+        if path in by_path:
+            plan["index"].append(path)
+    return plan
 
 
 def prepare(
@@ -183,12 +243,17 @@ def prepare(
     allow_unregistered: bool = False,
     merge_empty_destinations: bool = False,
     remove_duplicates: bool = False,
+    merge_destinations: bool = False,
 ) -> dict:
     """Pure planning: never mutates the supplied snapshot or index.
 
     ``merge_empty_destinations`` lets a root move onto an existing empty folder
     record at ``artifacts/<root>`` (no children in the CRDT or the index): the
     empty record is dropped and the source folder keeps its ID.
+    ``merge_destinations`` merges a root into a NON-empty ``artifacts/<root>``:
+    unpaired source files move in, identical pairs (same type and sha256) are
+    removed from the source side, and any same-path pair that differs refuses
+    the whole root; nothing is ever overwritten.
     ``remove_duplicates`` removes a legacy root whose ``artifacts/<root>`` copy
     already holds every file with an identical sha256, in the CRDT and the index.
 
@@ -238,7 +303,18 @@ def prepare(
             if merge_empty_destinations and empty_placeholder(before, indexed, target):
                 merged.append(target)
                 continue
-            if remove_duplicates:
+            overlap = merge_plan(before, items, source, target, allow_unregistered)
+            if merge_destinations:
+                if overlap["problem"]:
+                    reason = overlap["problem"]
+                elif overlap["conflicts"]:
+                    reason = "conflicts: " + "; ".join(sorted(overlap["conflicts"]))
+                else:
+                    merged.append(target)
+                    duplicates["crdt"] += overlap["crdt"]
+                    duplicates["index"] += overlap["index"]
+                    continue
+            if remove_duplicates and not merge_destinations:
                 reason = duplicate_problem(before, items, source, target)
                 if reason is None:
                     del mapping[source]
@@ -255,6 +331,10 @@ def prepare(
                     ]
                     continue
             detail = describe_destination(before, items, source, target)
+            detail += (
+                f"; overlap identical={len(set(overlap['index']) | set(overlap['crdt']))} "
+                f"conflicting={len(overlap['conflicts'])}"
+            )
             problems.append(
                 f"{target} (source {source}): {detail}"
                 + (f"; not a verified duplicate: {reason}" if reason else "")
@@ -297,6 +377,8 @@ def prepare(
             raise Refused(f"CRDT destination collision: {target} (source {path})")
     for name, values in before.items():
         for path in values:
+            if path in duplicates["crdt"]:
+                continue
             target = destination(path)
             if target != path and target in values and target not in merged:
                 raise Refused(
@@ -633,6 +715,13 @@ def parser() -> argparse.ArgumentParser:
         help="Remove a legacy root whose artifacts/<root> copy holds every file with "
         "an identical sha256 (default: refuse)",
     )
+    result.add_argument(
+        "--merge-destination-folders",
+        action="store_true",
+        help="Merge a root into an existing NON-empty artifacts/<root>: move unpaired "
+        "files, drop identical (sha256) duplicates, refuse on any differing "
+        "same-path file (default: refuse)",
+    )
     result.add_argument("--database-url-env", default="DATABASE_URL")
     result.add_argument(
         "--extra-root",
@@ -709,6 +798,7 @@ def main(argv: list[str] | None = None) -> int:
                         allow_unregistered=args.allow_unregistered_files,
                         merge_empty_destinations=args.merge_empty_destination_folders,
                         remove_duplicates=args.remove_duplicate_roots,
+                        merge_destinations=args.merge_destination_folders,
                     )
                 )
             if args.resume or args.rollback:
