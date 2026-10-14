@@ -20,6 +20,9 @@ class ShareBase(BaseModel):
 
 
 class ShareCreate(ShareBase):
+    # Optional vault identity (GH #265). Omitted by old plugins = legacy behavior.
+    vault_id: str | None = Field(default=None, min_length=1, max_length=128)
+    vault_name: str | None = Field(default=None, max_length=255)
     password: str | None = Field(default=None, min_length=8, max_length=128)
     web_published: bool = False
     web_slug: str | None = Field(default=None, min_length=1, max_length=255)
@@ -82,6 +85,8 @@ class ShareRead(BaseModel):
     path: str
     visibility: ShareVisibility
     owner_user_id: uuid.UUID
+    vault_id: str | None = None
+    vault_name: str | None = None
     created_at: datetime
     updated_at: datetime
     web_published: bool
@@ -132,5 +137,7 @@ class ShareListItem(BaseModel):
     web_noindex: bool
     web_sync_mode: str
     web_url: str | None = None  # Computed field, set by service
+    vault_id: str | None = None
+    vault_name: str | None = None
 
     model_config = {"from_attributes": True}

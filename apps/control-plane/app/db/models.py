@@ -168,6 +168,11 @@ class Share(Base, TimestampMixin):
         nullable=False,
     )
     path: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Optional vault identity (GH #265): a stable per-vault id sent by the
+    # plugin so one owner can hold a whole-vault (path="") share per vault.
+    # NULL = legacy share created without a vault (old plugins).
+    vault_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    vault_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     visibility: Mapped[ShareVisibility] = mapped_column(
         PgEnum(
             ShareVisibility, name="sharevisibility", values_callable=lambda x: [e.value for e in x]

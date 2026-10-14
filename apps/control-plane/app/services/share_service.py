@@ -165,6 +165,11 @@ def create_share(
         models.Share.owner_user_id == owner.id,
         models.Share.kind == payload.kind,
         models.Share.path == payload.path,
+        # GH #265: vault identity is part of the key. NULL == NULL (legacy)
+        # still collides; two different vault_ids at the same path do not.
+        (models.Share.vault_id == payload.vault_id)
+        if payload.vault_id is not None
+        else models.Share.vault_id.is_(None),
     )
     # .first(), not scalar_one_or_none(): rows predating this check may already
     # contain duplicates, and that must surface as this 409 rather than as a
@@ -215,6 +220,8 @@ def create_share(
     share = models.Share(
         kind=payload.kind,
         path=payload.path,
+        vault_id=payload.vault_id,
+        vault_name=payload.vault_name,
         visibility=payload.visibility,
         password_hash=password_hash,
         owner_user_id=owner.id,
@@ -828,6 +835,8 @@ def list_user_shares(
                 web_noindex=share.web_noindex,
                 web_sync_mode=share.web_sync_mode,
                 web_url=get_web_url(share),
+                vault_id=share.vault_id,
+                vault_name=share.vault_name,
             )
         )
 
@@ -930,7 +939,12 @@ def validate_path_within_folder(folder_path: str, file_path: str) -> bool:
     return file_path.startswith(folder_path_normalized)
 
 
-def find_share_for_path(db: Session, user: models.User, file_path: str) -> models.Share | None:
+def find_share_for_path(
+    db: Session,
+    user: models.User,
+    file_path: str,
+    vault_id: str | None = None,
+) -> models.Share | None:
     """
     Find the most specific share that covers a file path.
 
@@ -942,6 +956,9 @@ def find_share_for_path(db: Session, user: models.User, file_path: str) -> model
         db: Database session
         user: User requesting access
         file_path: Path to the file (e.g., "Projects/subdir/file.md")
+        vault_id: When supplied, only shares of that vault are considered, so a
+            root share of vault B never captures files of vault A (GH #265).
+            None = legacy behavior (no vault scoping).
 
     Returns:
         Share object if found and user has access, None otherwise
@@ -958,6 +975,8 @@ def find_share_for_path(db: Session, user: models.User, file_path: str) -> model
     stmt = select(models.Share).where(
         models.Share.kind == models.ShareKind.DOC, models.Share.path == file_path
     )
+    if vault_id is not None:
+        stmt = stmt.where(models.Share.vault_id == vault_id)
     doc_share = db.execute(stmt).scalar_one_or_none()
 
     # If doc share exists, check user access
@@ -974,6 +993,8 @@ def find_share_for_path(db: Session, user: models.User, file_path: str) -> model
         .where(models.Share.kind == models.ShareKind.FOLDER)
         .options(joinedload(models.Share.members))
     )
+    if vault_id is not None:
+        stmt = stmt.where(models.Share.vault_id == vault_id)
     folder_shares = db.execute(stmt).unique().scalars().all()
 
     # Filter to shares where file is within folder and user has access
