@@ -67,8 +67,10 @@ and every other collision still fails.
   differs, or cannot be proven identical, refuses the whole root and is listed
   as `conflicts: <path>: <reason>`. Nothing is overwritten. The destination
   folder record, if any, is replaced by the source folder's record (the source
-  ID is kept); a destination that has its own legacy-docs or index entry is
-  refused. Index-only files (uploaded through the API) are compared by index
+  ID is kept); a destination that has its own legacy-docs entry, or an index
+  entry that is not a folder row, is refused. A bare folder row for the
+  destination root in the index (the usual production shape) is accepted: it is
+  dropped when the source root has a row too, which takes its place. Index-only files (uploaded through the API) are compared by index
   row, and only with `--allow-unregistered-files`. Without any flag the
   collision message also reports `overlap identical=N conflicting=M`.
 
