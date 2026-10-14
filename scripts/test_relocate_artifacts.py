@@ -1110,3 +1110,80 @@ def test_merge_destinations_handles_index_only_destination_without_crdt_record()
     assert "artifacts/deadbeef/own.bin" in paths
     assert "deadbeef/file.bin" not in paths
     assert "deadbeef/file.bin" in plan["removed_duplicates"]["index"]
+
+
+def folder_row(path):
+    return {"path": path, "name": path.rsplit("/", 1)[-1], "type": "folder"}
+
+
+def test_merge_destinations_accepts_destination_folder_index_row():
+    # Production shape: the destination root has a CRDT folder record AND its
+    # own bare folder row in the index; the source root has one too.
+    doc, items = merge_fixture()
+    rows = [*items, folder_row("artifacts/deadbeef"), folder_row("deadbeef")]
+    with pytest.raises(relocate.Refused, match="collision"):
+        relocate.prepare(doc.get_update(), rows, "argus")
+    plan = relocate.prepare(doc.get_update(), rows, "argus", merge_destinations=True)
+    paths = [i["path"] for i in plan["after_index"]]
+    assert paths.count("artifacts/deadbeef") == 1
+    assert "deadbeef" not in paths
+    assert "artifacts/deadbeef/extra.bin" in paths
+    assert "artifacts/deadbeef" in plan["removed_duplicates"]["index"]
+    after = plan["after_maps"]["filemeta_v0"]
+    assert after["artifacts/deadbeef"]["id"] == "folder-id"
+
+
+def test_merge_destinations_keeps_destination_folder_row_without_source_row():
+    doc, items = merge_fixture()
+    rows = [*items, folder_row("artifacts/deadbeef")]
+    plan = relocate.prepare(doc.get_update(), rows, "argus", merge_destinations=True)
+    paths = [i["path"] for i in plan["after_index"]]
+    assert paths.count("artifacts/deadbeef") == 1
+    assert "artifacts/deadbeef" not in plan["removed_duplicates"]["index"]
+
+
+def test_merge_destinations_refuses_destination_index_row_that_is_a_file():
+    doc, items = merge_fixture()
+    rows = [*items, {**items[1], "path": "artifacts/deadbeef", "sha256": "x"}]
+    with pytest.raises(relocate.Refused, match="own docs or index entry"):
+        relocate.prepare(doc.get_update(), rows, "argus", merge_destinations=True)
+
+
+def test_merge_destinations_refuses_source_root_index_row_that_is_a_file():
+    # A file-typed source root row must not replace the destination folder row.
+    doc, items = merge_fixture()
+    rows = [
+        *items,
+        folder_row("artifacts/deadbeef"),
+        {**items[1], "path": "deadbeef", "sha256": "x"},
+    ]
+    with pytest.raises(relocate.Refused, match="index row is not a folder"):
+        relocate.prepare(doc.get_update(), rows, "argus", merge_destinations=True)
+
+
+def test_merge_destinations_folder_row_does_not_weaken_file_protection():
+    doc, items = merge_fixture(dest_sha="other-hash")
+    rows = [*items, folder_row("artifacts/deadbeef"), folder_row("deadbeef")]
+    with pytest.raises(relocate.Refused, match="conflicts: note.md.*differs in sha256"):
+        relocate.prepare(doc.get_update(), rows, "argus", merge_destinations=True)
+
+
+def test_merge_destinations_folder_row_without_crdt_record_at_destination():
+    # Spark shape: destination has no CRDT record, only index rows incl. a folder row.
+    doc, items = fixture()
+    rows = [
+        *items,
+        folder_row("artifacts/deadbeef"),
+        {**items[1], "path": "artifacts/deadbeef/own.bin", "sha256": "own-hash"},
+    ]
+    plan = relocate.prepare(
+        doc.get_update(),
+        rows,
+        "argus",
+        allow_unregistered=True,
+        merge_destinations=True,
+    )
+    paths = [i["path"] for i in plan["after_index"]]
+    assert paths.count("artifacts/deadbeef") == 1
+    assert "artifacts/deadbeef/own.bin" in paths
+    assert "artifacts/deadbeef/file.bin" in paths

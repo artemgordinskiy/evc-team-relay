@@ -211,9 +211,18 @@ def merge_plan(
     by_path = {i["path"]: i for i in items}
     plan = {"crdt": [], "index": [], "conflicts": [], "problem": None}
     record = meta.get(target)
+    if target in by_path and source in by_path:
+        # A bare folder row at the destination yields to the source root row,
+        # which moves onto the same path.
+        if by_path[source].get("type") == "folder":
+            plan["index"].append(target)
+        else:
+            plan["problem"] = f"source root {source} index row is not a folder"
     if record and record.get("type") != "folder":
         plan["problem"] = "destination is not a folder record"
-    elif target in before["docs"] or target in by_path:
+    elif target in before["docs"] or (
+        target in by_path and by_path[target].get("type") != "folder"
+    ):
         plan["problem"] = "destination has its own docs or index entry"
     elif (meta.get(source) or {}).get("type") != "folder":
         plan["problem"] = f"source root {source} is not a folder record"
@@ -253,7 +262,9 @@ def prepare(
     ``merge_destinations`` merges a root into a NON-empty ``artifacts/<root>``:
     unpaired source files move in, identical pairs (same type and sha256) are
     removed from the source side, and any same-path pair that differs refuses
-    the whole root; nothing is ever overwritten.
+    the whole root; nothing is ever overwritten. A destination root that has a
+    bare folder row of its own in the index (no docs entry) is accepted: the row
+    is dropped when the source root has one, otherwise it is kept.
     ``remove_duplicates`` removes a legacy root whose ``artifacts/<root>`` copy
     already holds every file with an identical sha256, in the CRDT and the index.
 
