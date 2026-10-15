@@ -204,9 +204,10 @@ region = "us-east-1"
 access_key = "your-minio-user"
 secret_key = "your-minio-password"
 
-[auth]
-# Control plane public key endpoint
-public_key_url = "http://control-plane:8000/keys/public"
+[[auth]]
+# Ed25519 public key matching RELAY_PRIVATE_KEY (see Installation > Relay keypair)
+key_id = "relay_cp_dev"
+public_key = "BASE64_PUBLIC_KEY"
 ```
 
 ## Reverse Proxy (Caddy)
