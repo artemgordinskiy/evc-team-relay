@@ -71,7 +71,7 @@ CONTROL_PLANE_PUBLIC_URL=https://cp.yourdomain.com
 openssl genpkey -algorithm ed25519 -out relay_private.pem
 # RELAY_PRIVATE_KEY= the base64 output of:
 openssl base64 -A -in relay_private.pem
-# You'll need the matching public key in step 3 below.
+# You'll need the matching public key in step 3 below (see "Relay keypair").
 ```
 
 See [Configuration Reference](configuration.md) for all options.
@@ -94,17 +94,58 @@ Edit `relay/relay.toml`:
 - `[store]` — MinIO credentials from `.env` (`MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`).
 - `[[auth]]` — `key_id` matches `RELAY_KEY_ID` in `.env` if you set one (defaults to `relay_cp_dev`
   if omitted); `public_key` is the Ed25519 public key derived from the private key you generated
-  in step 2:
-  ```bash
-  python3 -c "
-  from cryptography.hazmat.primitives import serialization
-  import base64
-  with open('relay_private.pem', 'rb') as f:
-      priv = serialization.load_pem_private_key(f.read(), password=None)
-  pub = priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-  print(base64.b64encode(pub).decode())
-  "
-  ```
+  in step 2. Use only the **public** key here, as a single base64 line (32 raw bytes) — see
+  [Relay keypair](#relay-keypair) below for the exact commands and the format.
+
+#### Relay keypair
+
+The relay signs and verifies tokens with an Ed25519 keypair. The two halves go to different places:
+
+| Half | Goes into | Never goes into |
+|------|-----------|-----------------|
+| Private key (base64 of the PEM file) | `RELAY_PRIVATE_KEY` in `.env` | `relay.toml`, git, logs, issues |
+| Public key (32 raw bytes, base64) | `public_key` in `[[auth]]` of `relay/relay.toml` | `.env` |
+
+Generate the pair (Linux, or macOS with Homebrew OpenSSL):
+
+```bash
+openssl genpkey -algorithm ed25519 -out relay_private.pem
+
+# Private half -> RELAY_PRIVATE_KEY in .env (one line, no wrapping)
+openssl base64 -A -in relay_private.pem; echo
+
+# Public half -> public_key in relay.toml (one line)
+openssl pkey -in relay_private.pem -pubout -outform DER | tail -c 32 | base64 | tr -d '\n'; echo
+```
+
+The public key prints as a 44-character base64 string ending in `=`, for example
+`RTj65XM+AWhN2ypdZfp5eQuLe16He5ihMXsSzqBy61M=` (a throwaway example — generate your own). Put it in
+`relay/relay.toml`:
+
+```toml
+[[auth]]
+key_id = "relay_cp_dev"   # must match RELAY_KEY_ID in .env (default: relay_cp_dev)
+public_key = "RTj65XM+AWhN2ypdZfp5eQuLe16He5ihMXsSzqBy61M="
+```
+
+> **macOS:** the system `/usr/bin/openssl` is LibreSSL and fails with `Algorithm ed25519 not found`.
+> Run `brew install openssl` and use `$(brew --prefix openssl)/bin/openssl`, or use the Python
+> alternative below.
+
+Python alternative (needs the `cryptography` package):
+
+```bash
+python3 -c "
+from cryptography.hazmat.primitives import serialization
+import base64
+with open('relay_private.pem', 'rb') as f:
+    priv = serialization.load_pem_private_key(f.read(), password=None)
+pub = priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+print(base64.b64encode(pub).decode())
+"
+```
+
+Keep `relay_private.pem` out of version control. If it leaks, generate a new pair and update both files.
 
 ### 4. Configure DNS
 
@@ -318,6 +359,15 @@ As with any storage change, take a copy of `data/minio/` (stop the stack first) 
 upgrading if the objects matter to you.
 
 ## Troubleshooting
+
+### Common Configuration Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `relay-server` restarts in a loop, log shows `Error: The token is not a valid format` | `public_key` in `[[auth]]` is not a 32-byte base64 Ed25519 key: typically the private key, a PEM block, or base64 of a PEM file was pasted | Put only the single-line public key from [Relay keypair](#relay-keypair) in `public_key`; the private key belongs in `.env` as `RELAY_PRIVATE_KEY` |
+| Same error after `openssl pkey -pubout \| base64` | That output is the PEM wrapper (or 44-byte DER), not the raw 32-byte key | Use the `-outform DER \| tail -c 32 \| base64` form above |
+| `Algorithm ed25519 not found` on macOS | System OpenSSL is LibreSSL | Install Homebrew OpenSSL or use the Python alternative |
+| Caddy keeps restarting / fails to load its config | `RELAY_DOMAIN` and `WEB_PUBLISH_DOMAIN` are set to the same hostname, so two sites claim one address | Give each its own hostname (e.g. `relay.example.com`, `docs.example.com`) |
 
 ### Service Won't Start
 
