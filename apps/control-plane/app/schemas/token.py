@@ -14,7 +14,7 @@ class TokenMode(str, Enum):
 
 class RelayTokenRequest(BaseModel):
     share_id: uuid.UUID
-    doc_id: str
+    doc_id: str = Field(min_length=1, max_length=512)  # matches relay_doc_bindings.doc_id
     mode: TokenMode = TokenMode.READ
     password: str | None = None
     file_path: str | None = None  # For folder shares: path of file within folder

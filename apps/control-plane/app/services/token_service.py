@@ -5,6 +5,7 @@ from datetime import timedelta
 
 from fastapi import HTTPException, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import security
@@ -20,6 +21,31 @@ def _find_share_by_id(db: Session, share_id: uuid.UUID) -> models.Share | None:
     """Look up a share by id without raising 404 (used for the H6 doc_id check)."""
     stmt = select(models.Share).where(models.Share.id == share_id)
     return db.execute(stmt).scalar_one_or_none()
+
+
+def _bind_doc_to_share(db: Session, doc_id: str, share: models.Share) -> None:
+    """Bind doc_id to `share` on first authorized issuance; 403 if another share owns it.
+
+    Called only after the caller passed the access check on `share`, so an
+    unauthorized caller can never claim a doc_id.
+    """
+    owner = db.get(models.RelayDocBinding, doc_id)
+    if owner is None:
+        db.add(models.RelayDocBinding(doc_id=doc_id, share_id=share.id))
+        try:
+            db.commit()
+            return
+        except IntegrityError:
+            # Lost a first-issue race: re-read the winner's binding.
+            db.rollback()
+            owner = db.get(models.RelayDocBinding, doc_id)
+            if owner is None:
+                raise
+    if owner.share_id != share.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="doc_id belongs to a different share",
+        )
 
 
 def issue_relay_token(
@@ -103,6 +129,19 @@ def issue_relay_token(
             share_service.ensure_write_access(db, share, user)
         else:
             share_service.ensure_read_access(db, share, user, password=payload.password)
+
+    # GHSA-9q47-g5jx-w24v: the relay authorizes by doc_id only, so the share
+    # named in the request must be the doc's owner. A doc_id equal to a real
+    # share's id is owned by that share (authorized above by the H6 check) and
+    # is bound to it, so the binding outlives the share if it is deleted.
+    owner_share = share
+    try:
+        doc_share = _find_share_by_id(db, uuid.UUID(str(payload.doc_id)))
+    except ValueError:
+        doc_share = None
+    if doc_share is not None:
+        owner_share = doc_share
+    _bind_doc_to_share(db, str(payload.doc_id), owner_share)
 
     settings = get_settings()
     expires_in = timedelta(minutes=settings.relay_token_ttl_minutes)
