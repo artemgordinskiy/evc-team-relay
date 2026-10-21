@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 from sqlalchemy import JSON, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, func, text
@@ -811,4 +811,24 @@ class BillingWebhookEvent(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+
+
+class RelayDocBinding(Base):
+    """doc_id -> owning share (GHSA-9q47-g5jx-w24v).
+
+    The relay authorizes a token by doc_id alone, so the control-plane must
+    never mint a token for a doc_id under a share other than the one that
+    owns it. Rows are created on the first authorized issuance for a doc_id
+    and never rewritten. No FK to shares on purpose: when a share is deleted
+    its documents may survive on the relay, so the binding must outlive it and
+    keep the doc_id unclaimable by any other share.
+    """
+
+    __tablename__ = "relay_doc_bindings"
+
+    doc_id: Mapped[str] = mapped_column(String(512), primary_key=True)
+    share_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )

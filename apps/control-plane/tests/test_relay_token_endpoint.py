@@ -521,6 +521,77 @@ class TestRelayTokenConfusedDeputy:
         assert resp.status_code == 200
 
 
+# ── GHSA-9q47-g5jx-w24v: doc_id -> share binding ─────────────
+
+
+class TestRelayTokenDocShareBinding:
+    """A doc_id is owned by the share it was first issued under. A (former)
+    member of share B must not obtain a token for a doc_id owned by share A
+    by naming share B (or any share they belong to) in the request."""
+
+    def _issue(self, client, token, share_id, doc_id, mode="read"):
+        return client.post(
+            "/tokens/relay",
+            json={"share_id": share_id, "doc_id": doc_id, "mode": mode},
+            headers=auth_headers(token),
+        )
+
+    def _setup(self, client):
+        admin_token = login(client, "bootstrap@example.com", "super-secret")
+        share_a = create_share(client, admin_token, kind="folder", path="vault/a")
+        share_b = create_share(client, admin_token, kind="folder", path="vault/b")
+        user_id = create_user(client, admin_token, "ex@example.com", "pass12345")
+        add_member(client, admin_token, share_a, user_id, "editor")
+        add_member(client, admin_token, share_b, user_id, "editor")
+        user_token = login(client, "ex@example.com", "pass12345")
+        # Owner syncs a file in share A: doc_id is now bound to A.
+        assert self._issue(client, admin_token, share_a, "file-doc-1").status_code == 200
+        return admin_token, share_a, share_b, user_id, user_token
+
+    def test_former_member_naming_other_share_gets_403(self, client: TestClient):
+        admin_token, share_a, share_b, user_id, user_token = self._setup(client)
+        resp = client.delete(
+            f"/shares/{share_a}/members/{user_id}", headers=auth_headers(admin_token)
+        )
+        assert resp.status_code == 204
+        for mode in ("read", "write"):
+            r = self._issue(client, user_token, share_b, "file-doc-1", mode)
+            assert r.status_code == 403, (mode, r.text)
+
+    def test_current_member_of_owning_share_gets_200(self, client: TestClient):
+        _, share_a, _, _, user_token = self._setup(client)
+        for mode in ("read", "write"):
+            assert self._issue(client, user_token, share_a, "file-doc-1", mode).status_code == 200
+
+    def test_binding_survives_share_deletion(self, client: TestClient):
+        admin_token, share_a, share_b, _, _ = self._setup(client)
+        resp = client.delete(f"/shares/{share_a}", headers=auth_headers(admin_token))
+        assert resp.status_code == 204, resp.text
+        assert self._issue(client, admin_token, share_b, "file-doc-1").status_code == 403
+
+    def test_whole_share_doc_id_stays_bound_after_share_deletion(self, client: TestClient):
+        admin_token, share_a, share_b, _, _ = self._setup(client)
+        assert self._issue(client, admin_token, share_a, share_a).status_code == 200
+        resp = client.delete(f"/shares/{share_a}", headers=auth_headers(admin_token))
+        assert resp.status_code == 204, resp.text
+        assert self._issue(client, admin_token, share_b, share_a).status_code == 403
+
+    def test_foreign_share_doc_id_repeat_issue_still_200(self, client: TestClient):
+        admin_token, share_a, share_b, _, _ = self._setup(client)
+        for _ in range(2):
+            assert self._issue(client, admin_token, share_a, share_b, "write").status_code == 200
+
+    def test_overlong_doc_id_rejected_422(self, client: TestClient):
+        admin_token, share_a, _, _, _ = self._setup(client)
+        assert self._issue(client, admin_token, share_a, "x" * 513).status_code == 422
+
+    def test_binding_is_stable_on_repeat_issue(self, client: TestClient):
+        admin_token, share_a, share_b, _, _ = self._setup(client)
+        # Admin is authorized on B too, but the doc belongs to A.
+        assert self._issue(client, admin_token, share_b, "file-doc-1").status_code == 403
+        assert self._issue(client, admin_token, share_a, "file-doc-1").status_code == 200
+
+
 # ── Error Cases ──────────────────────────────────────────────
 
 
