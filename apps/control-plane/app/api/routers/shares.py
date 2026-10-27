@@ -18,6 +18,7 @@ from slowapi.util import get_remote_address
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
+from starlette.concurrency import run_in_threadpool
 
 from app.api import deps
 from app.core import agent_key_scopes, security
@@ -457,6 +458,99 @@ def _require_sync_precondition(
         )
 
 
+def _sync_write_locked(
+    db: Session,
+    share_id: uuid.UUID,
+    path: str,
+    body: bytes,
+    mime: str,
+    sha256: str,
+    if_match: str | None,
+    if_none_match: str | None,
+) -> tuple[str, bool]:
+    """Compare-and-swap one index entry; returns (updated_at, is_new_file).
+
+    Row lock, then check, then write — in that order and in one transaction.
+    The web-publish sync-upload deliberately keeps MinIO I/O outside the row
+    lock (pool-lock hygiene), but that trade is only safe when the write is
+    unconditional. Here a failed precondition must leave BOTH the index and
+    the object store untouched, which only holds if the compare and the swap
+    sit in the same critical section.
+
+    The transaction ends here on every path: COMMIT on success, ROLLBACK on
+    any exception. A refused write used to raise with the row lock still
+    held, leaving it to get_db's cleanup; that cleanup is dispatched by the
+    event loop, which the next writer's lock wait had blocked, so the worker
+    deadlocked until restart. For the same reason this function blocks and is
+    called through run_in_threadpool: a lock wait on the event loop stalls
+    every request the worker serves, including the one holding the lock.
+    """
+    is_text = mime.startswith("text/") or mime in ("application/json", "application/xml")
+    try:
+        locked = db.execute(
+            select(models.Share).where(models.Share.id == share_id).with_for_update()
+        ).scalar_one_or_none()
+        if locked is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
+
+        folder_items = list(locked.web_folder_items or [])
+        current = next((i for i in folder_items if i.get("path") == path), None)
+        _require_sync_precondition(if_match, if_none_match, current, path)
+
+        settings = get_settings()
+        minio_client = _get_minio_client()
+        _ensure_minio_bucket(minio_client, settings.minio_bucket)
+        # Same storage layout as web-publish sync-upload: text is content-addressed
+        # (dedup for the plugin), binary keeps its path so /_assets/ can serve it.
+        storage_key = (
+            f"sync-uploads/{locked.id}/{sha256}" if is_text else f"web-assets/{locked.id}/{path}"
+        )
+        try:
+            minio_client.put_object(
+                settings.minio_bucket,
+                storage_key,
+                io.BytesIO(body),
+                length=len(body),
+                content_type=mime,
+            )
+        except S3Error as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to store document: {e}",
+            )
+
+        now_iso = security.utcnow().isoformat()
+        inline_content = (
+            body.decode("utf-8", errors="replace") if (is_text and len(body) < 256 * 1024) else None
+        )
+        entry = {
+            "path": path,
+            "name": path.split("/")[-1],
+            "type": "doc" if is_text else "asset",
+            "source": "sync-artifact",
+            "mime": mime,
+            "size": len(body),
+            "sha256": sha256,
+            "modified_at": now_iso,
+            "storage_key": storage_key,
+            "content": inline_content,
+        }
+        is_new_file = current is None
+        if is_new_file:
+            folder_items.append(entry)
+        else:
+            current.update(entry)
+
+        locked.web_folder_items = folder_items
+        flag_modified(locked, "web_folder_items")
+        locked.web_content_updated_at = security.utcnow()
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    return now_iso, is_new_file
+
+
 @router.put("/{share_id}/sync-write", response_model=SyncWriteResult)
 @limiter.limit("60/minute")
 async def sync_write_file(
@@ -507,73 +601,19 @@ async def sync_write_file(
         )
 
     mime = request.headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
-    is_text = mime.startswith("text/") or mime in ("application/json", "application/xml")
     sha256 = hashlib.sha256(body).hexdigest()
 
-    # Row lock, then check, then write — in that order and in one transaction.
-    # The web-publish sync-upload deliberately keeps MinIO I/O outside the row
-    # lock (pool-lock hygiene), but that trade is only safe when the write is
-    # unconditional. Here a failed precondition must leave BOTH the index and
-    # the object store untouched, which only holds if the compare and the swap
-    # sit in the same critical section.
-    locked = db.execute(
-        select(models.Share).where(models.Share.id == resolved_share_id).with_for_update()
-    ).scalar_one_or_none()
-    if locked is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
-
-    folder_items = list(locked.web_folder_items or [])
-    current = next((i for i in folder_items if i.get("path") == path), None)
-    _require_sync_precondition(if_match, if_none_match, current, path)
-
-    settings = get_settings()
-    minio_client = _get_minio_client()
-    _ensure_minio_bucket(minio_client, settings.minio_bucket)
-    # Same storage layout as web-publish sync-upload: text is content-addressed
-    # (dedup for the plugin), binary keeps its path so /_assets/ can serve it.
-    storage_key = (
-        f"sync-uploads/{locked.id}/{sha256}" if is_text else f"web-assets/{locked.id}/{path}"
+    now_iso, is_new_file = await run_in_threadpool(
+        _sync_write_locked,
+        db,
+        resolved_share_id,
+        path,
+        body,
+        mime,
+        sha256,
+        if_match,
+        if_none_match,
     )
-    try:
-        minio_client.put_object(
-            settings.minio_bucket,
-            storage_key,
-            io.BytesIO(body),
-            length=len(body),
-            content_type=mime,
-        )
-    except S3Error as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to store document: {e}",
-        )
-
-    now_iso = security.utcnow().isoformat()
-    inline_content = (
-        body.decode("utf-8", errors="replace") if (is_text and len(body) < 256 * 1024) else None
-    )
-    entry = {
-        "path": path,
-        "name": path.split("/")[-1],
-        "type": "doc" if is_text else "asset",
-        "source": "sync-artifact",
-        "mime": mime,
-        "size": len(body),
-        "sha256": sha256,
-        "modified_at": now_iso,
-        "storage_key": storage_key,
-        "content": inline_content,
-    }
-    is_new_file = current is None
-    if is_new_file:
-        folder_items.append(entry)
-    else:
-        current.update(entry)
-
-    locked.web_folder_items = folder_items
-    flag_modified(locked, "web_folder_items")
-    locked.web_content_updated_at = security.utcnow()
-    db.commit()
 
     logger.info(
         "sync_write",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,7 +12,8 @@ import anyio
 import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from fastapi import Request, Response
+from fastapi import HTTPException, Request, Response
+from minio.error import S3Error
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import QueuePool
@@ -279,3 +281,100 @@ def test_probes_respond_when_sync_worker_pool_is_busy(path, marker):
             limiter.total_tokens = previous
 
     asyncio.run(exercise())
+
+
+def _sync_write_request(raw_key: str, **headers: str) -> Request:
+    async def receive():
+        return {"type": "http.request", "body": b"new content", "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "headers": [(b"x-agent-key", raw_key.encode())]
+            + [(name.lower().encode(), value.encode()) for name, value in headers.items()],
+            "method": "PUT",
+            "path": "/test",
+            "client": ("127.0.0.1", 1234),
+        },
+        receive,
+    )
+
+
+def _storage_failure(*args, **kwargs):
+    raise S3Error(MagicMock(), "InternalError", "storage down", "/", "req", "host")
+
+
+@pytest.mark.parametrize(
+    "path,if_match,if_none_match,put_object,expected",
+    [
+        ("a.bin", '"' + "0" * 64 + '"', None, None, 412),  # stale
+        ("a.bin", None, "*", None, 412),  # create over an existing file
+        ("missing.bin", '"' + "0" * 64 + '"', None, None, 412),  # update of a missing file
+        ("new.bin", None, "*", _storage_failure, 500),  # object store failure
+    ],
+    ids=["stale", "exists", "missing", "storage-failure"],
+)
+def test_refused_sync_write_releases_its_row_lock(
+    sync_db, monkeypatch, path, if_match, if_none_match, put_object, expected
+):
+    # A refused write must end its transaction before the handler returns.
+    # Leaving it open kept the share's row lock until get_db's cleanup, which
+    # the next writer's blocked lock wait prevented from ever running.
+    engine, _, share_id, raw_key = sync_db
+    storage = MagicMock()
+    storage.put_object.side_effect = put_object
+    monkeypatch.setattr(shares, "_get_minio_client", lambda: storage)
+    with Session(engine) as db:
+        with pytest.raises(HTTPException) as refused:
+            asyncio.run(
+                shares.sync_write_file(
+                    _sync_write_request(raw_key),
+                    Response(),
+                    share_id,
+                    path,
+                    if_match,
+                    if_none_match,
+                    db,
+                    None,
+                )
+            )
+        assert refused.value.status_code == expected
+        assert not db.in_transaction()
+
+    with Session(engine) as observer:
+        items = observer.get(models.Share, share_id).web_folder_items
+    assert items == [{"path": "a.bin", "storage_key": "test/a.bin"}]
+
+
+def test_sync_write_critical_section_runs_off_the_event_loop(sync_db, monkeypatch):
+    # The row-lock wait and the object-store write block. On the event loop
+    # they would stall every other request the worker is serving.
+    engine, _, share_id, raw_key = sync_db
+    release = threading.Event()
+    storage = MagicMock()
+    storage.put_object.side_effect = lambda *args, **kwargs: release.wait(timeout=5)
+    monkeypatch.setattr(shares, "_get_minio_client", lambda: storage)
+
+    async def exercise(db):
+        write = asyncio.create_task(
+            shares.sync_write_file(
+                _sync_write_request(raw_key),
+                Response(),
+                share_id,
+                "new.bin",
+                None,
+                "*",
+                db,
+                None,
+            )
+        )
+        while not storage.put_object.called:
+            await asyncio.sleep(0.01)
+        # The loop got control back while the write sits in storage I/O.
+        assert not write.done()
+        release.set()
+        return await write
+
+    with Session(engine) as db:
+        result = asyncio.run(exercise(db))
+    assert result.sha256 == hashlib.sha256(b"new content").hexdigest()
