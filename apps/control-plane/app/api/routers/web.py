@@ -1220,7 +1220,8 @@ async def upload_mesh_artifact(
             models.Share.web_slug == share_identifier,
             models.Share.web_published == True,  # noqa: E712
         )
-    share = db.execute(stmt.with_for_update()).scalar_one_or_none()
+    # No row lock yet: it must not be held across the body read or MinIO I/O.
+    share = db.execute(stmt).scalar_one_or_none()
     if not share:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
     if share.kind != models.ShareKind.FOLDER:
@@ -1243,6 +1244,12 @@ async def upload_mesh_artifact(
             status_code=status.HTTP_403_FORBIDDEN, detail="Agent key does not have write scope"
         )
 
+    # Authentication is complete. Release the connection before awaiting the
+    # body: a share row lock held across that await deadlocked the worker as
+    # soon as a second upload to the same share blocked the event loop on it.
+    share_id, agent_key_id = share.id, agent_key.id
+    db.close()
+
     # Read body with size cap
     body = await request.body()
     if len(body) > MAX_MESH_UPLOAD_SIZE:
@@ -1258,7 +1265,7 @@ async def upload_mesh_artifact(
     bucket_name = settings.minio_bucket
     _ensure_minio_bucket(minio_client, bucket_name)
 
-    object_name = f"web-assets/{share.id}/{path}"
+    object_name = f"web-assets/{share_id}/{path}"
     data_stream = io.BytesIO(body)
     try:
         minio_client.put_object(
@@ -1278,8 +1285,8 @@ async def upload_mesh_artifact(
         "agent_key.used",
         extra={
             "event": "agent_key.used",
-            "key_id": str(agent_key.id),
-            "share_id": str(share.id),
+            "key_id": str(agent_key_id),
+            "share_id": str(share_id),
             "path": path,
             "ip": get_client_ip(request),
         },
@@ -1287,6 +1294,13 @@ async def upload_mesh_artifact(
 
     # Upsert index entry in web_folder_items
     from sqlalchemy.orm.attributes import flag_modified
+
+    # Row lock only for the JSONB mutation; nothing below awaits before commit.
+    share = db.execute(
+        select(models.Share).where(models.Share.id == share_id).with_for_update()
+    ).scalar_one_or_none()
+    if not share:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
 
     now_iso = security.utcnow().isoformat()
     is_text = mime.startswith("text/") or mime in ("application/json", "application/xml")
@@ -1335,7 +1349,7 @@ async def upload_mesh_artifact(
     share.web_content_updated_at = security.utcnow()
 
     # Update key last_used_at
-    agent_key.last_used_at = security.utcnow()
+    db.get(models.ShareAgentKey, agent_key_id).last_used_at = security.utcnow()
 
     db.commit()
 
@@ -1659,6 +1673,12 @@ async def sync_upload(
         )
     agent_key = _auth_agent_key(share, request, db, required_scope="write")
 
+    # Release the connection before awaiting the body, as sync-write does. This
+    # also discards the unlocked snapshot, so the locked re-read below sees the
+    # current index rather than the identity map's stale copy of it.
+    resolved_share_id, agent_key_id = share.id, agent_key.id
+    db.close()
+
     body = await request.body()
     if len(body) > MAX_MESH_UPLOAD_SIZE:
         raise HTTPException(
@@ -1677,9 +1697,9 @@ async def sync_upload(
     _ensure_minio_bucket(minio_client, bucket_name)
 
     if is_text:
-        storage_key = f"sync-uploads/{share.id}/{sha256}"
+        storage_key = f"sync-uploads/{resolved_share_id}/{sha256}"
     else:
-        storage_key = f"web-assets/{share.id}/{path}"
+        storage_key = f"web-assets/{resolved_share_id}/{path}"
 
     try:
         minio_client.put_object(
@@ -1699,8 +1719,8 @@ async def sync_upload(
         "agent_key.used",
         extra={
             "event": "sync_upload",
-            "key_id": str(agent_key.id),
-            "share_id": str(share.id),
+            "key_id": str(agent_key_id),
+            "share_id": str(resolved_share_id),
             "path": path,
             "sha256": sha256,
             "ip": get_client_ip(request),
@@ -1710,7 +1730,9 @@ async def sync_upload(
     # H-M pool-lock: now acquire the row lock only for the JSONB mutation (no I/O under lock).
     from sqlalchemy.orm.attributes import flag_modified
 
-    share = db.execute(_stmt.with_for_update()).scalar_one_or_none()
+    share = db.execute(
+        select(models.Share).where(models.Share.id == resolved_share_id).with_for_update()
+    ).scalar_one_or_none()
     if not share:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
 
@@ -1759,7 +1781,7 @@ async def sync_upload(
     share.web_folder_items = folder_items
     flag_modified(share, "web_folder_items")
     share.web_content_updated_at = security.utcnow()
-    agent_key.last_used_at = security.utcnow()
+    db.get(models.ShareAgentKey, agent_key_id).last_used_at = security.utcnow()
     db.commit()
 
     # Build response URLs.

@@ -18,8 +18,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import QueuePool
 
-from app.api.routers import shares
+from app.api.routers import shares, web
 from app.core import security
+from app.core.config import get_settings
 from app.db import models
 from app.main import build_app
 from app.schemas.share import ShareCreate
@@ -378,3 +379,93 @@ def test_sync_write_critical_section_runs_off_the_event_loop(sync_db, monkeypatc
     with Session(engine) as db:
         result = asyncio.run(exercise(db))
     assert result.sha256 == hashlib.sha256(b"new content").hexdigest()
+
+
+@pytest.fixture
+def web_publish(monkeypatch):
+    monkeypatch.setenv("WEB_PUBLISH_DOMAIN", "docs.test.com")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def _web_upload(route: str, db: Session, share_id, raw_key: str, receive) -> dict:
+    request = Request(
+        {
+            "type": "http",
+            "headers": [(b"x-agent-key", raw_key.encode()), (b"content-type", b"text/markdown")],
+            "method": "POST",
+            "path": "/test",
+            "client": ("127.0.0.1", 1234),
+        },
+        receive,
+    )
+    handler = web.upload_mesh_artifact if route == "mesh-upload" else web.sync_upload
+    return asyncio.run(handler(request, str(share_id), "new.md", db))
+
+
+async def _new_content():
+    return {"type": "http.request", "body": b"new content", "more_body": False}
+
+
+@pytest.mark.parametrize("route", ["mesh-upload", "sync-upload"])
+def test_web_upload_holds_no_transaction_across_body_or_storage(
+    sync_db, web_publish, monkeypatch, route
+):
+    # The mesh upload used to take the share's row lock first and keep it
+    # across the body await; a second upload to the same share then blocked
+    # the event loop on that lock and the worker deadlocked.
+    engine, _, share_id, raw_key = sync_db
+    storage = MagicMock()
+    monkeypatch.setattr(web, "_get_minio_client", lambda: storage)
+    with Session(engine) as db:
+
+        def assert_pool_free(*args, **kwargs):
+            assert not db.in_transaction()
+            with engine.connect() as conn:
+                assert conn.execute(select(1)).scalar() == 1
+
+        async def receive():
+            assert_pool_free()
+            return await _new_content()
+
+        storage.put_object.side_effect = assert_pool_free
+        _web_upload(route, db, share_id, raw_key, receive)
+    storage.put_object.assert_called_once()
+
+    with Session(engine) as observer:
+        items = observer.get(models.Share, share_id).web_folder_items
+    assert any(item["path"] == "new.md" for item in items)
+
+
+@pytest.mark.parametrize("route", ["mesh-upload", "sync-upload"])
+def test_web_upload_keeps_index_entries_committed_meanwhile(
+    sync_db, web_publish, monkeypatch, route
+):
+    # Another upload commits its entry while this one stores its bytes. The
+    # locked re-read must see that entry: updating the session's copy from
+    # before the body read silently dropped it.
+    engine, _, share_id, raw_key = sync_db
+    other_worker = create_engine(engine.url)
+
+    def concurrent_upload(*args, **kwargs):
+        with Session(other_worker) as db:
+            share = db.get(models.Share, share_id)
+            share.web_folder_items = [
+                *share.web_folder_items,
+                {"path": "other.md", "storage_key": "test/other.md"},
+            ]
+            db.commit()
+
+    storage = MagicMock()
+    storage.put_object.side_effect = concurrent_upload
+    monkeypatch.setattr(web, "_get_minio_client", lambda: storage)
+    try:
+        with Session(engine) as db:
+            _web_upload(route, db, share_id, raw_key, _new_content)
+    finally:
+        other_worker.dispose()
+
+    with Session(engine) as observer:
+        items = observer.get(models.Share, share_id).web_folder_items
+    assert sorted(item["path"] for item in items) == ["a.bin", "new.md", "other.md"]
